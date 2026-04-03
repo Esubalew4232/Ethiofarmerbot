@@ -22,7 +22,7 @@ import shutil
 import re
 
 # ==================== CONFIGURATION ====================
-BOT_TOKEN = "8695223088:AAE75XugC7ojWOrnCig0M62R9mophpqcglw"
+BOT_TOKEN = "8302342021:AAHr9jDRK-yGqxodl0lCMadEP4u3N0xQK8A"
 BOT_NAME = "Ethio Farmer"
 OWNER_ID = 8360602913
 ADMIN_IDS = [8360602913]
@@ -655,7 +655,7 @@ def init_database():
     start_background_tasks()
     update_all_users_mandatory_channels()
 
-# ==================== EXPORT TASKS FUNCTIONS ====================
+# ==================== EXPORT TASKS FUNCTIONS (FIXED) ====================
 def export_completed_tasks_to_csv() -> Tuple[BytesIO, int]:
     """Export completed tasks to CSV with only Name, Father Name, Email, Password"""
     conn = Database.get_connection()
@@ -679,12 +679,12 @@ def export_completed_tasks_to_csv() -> Tuple[BytesIO, int]:
     # Write data rows
     for row in rows:
         task_dict = dict(row)
-        writer.writerow([
-            task_dict['name'],
-            task_dict['father_name'] or '',
-            f"{task_dict['address']}@gmail.com",
-            task_dict['password']
-        ])
+        name = task_dict['name'] or ''
+        father_name = task_dict['father_name'] or ''
+        email = f"{task_dict['address']}@gmail.com" if task_dict['address'] else ''
+        password = task_dict['password'] or ''
+        
+        writer.writerow([name, father_name, email, password])
     
     output.seek(0)
     return output, len(rows)
@@ -710,18 +710,49 @@ def export_failed_tasks_to_csv() -> Tuple[BytesIO, int]:
     
     for row in rows:
         task_dict = dict(row)
-        writer.writerow([
-            task_dict['name'],
-            task_dict['father_name'] or '',
-            f"{task_dict['address']}@gmail.com",
-            task_dict['password']
-        ])
+        name = task_dict['name'] or ''
+        father_name = task_dict['father_name'] or ''
+        email = f"{task_dict['address']}@gmail.com" if task_dict['address'] else ''
+        password = task_dict['password'] or ''
+        
+        writer.writerow([name, father_name, email, password])
     
     output.seek(0)
     return output, len(rows)
 
-# ==================== DELETE TASKS FUNCTIONS ====================
-def delete_single_completed_task(task_id: int, admin_id: int) -> Tuple[bool, str]:
+def export_expired_tasks_to_csv() -> Tuple[BytesIO, int]:
+    """Export expired tasks to CSV with only Name, Father Name, Email, Password"""
+    conn = Database.get_connection()
+    cursor = conn.cursor()
+    
+    cursor.execute('''
+    SELECT name, father_name, address, password
+    FROM tasks
+    WHERE status = 'expired'
+    ORDER BY completed_time DESC
+    ''')
+    
+    rows = cursor.fetchall()
+    
+    output = BytesIO()
+    writer = csv.writer(output)
+    
+    writer.writerow(['Name', 'Father Name', 'Email', 'Password'])
+    
+    for row in rows:
+        task_dict = dict(row)
+        name = task_dict['name'] or ''
+        father_name = task_dict['father_name'] or ''
+        email = f"{task_dict['address']}@gmail.com" if task_dict['address'] else ''
+        password = task_dict['password'] or ''
+        
+        writer.writerow([name, father_name, email, password])
+    
+    output.seek(0)
+    return output, len(rows)
+
+# ==================== DELETE TASKS FUNCTIONS (FIXED) ====================
+def delete_single_completed_task(task_id: str, admin_id: int) -> Tuple[bool, str]:
     """Delete a single completed task by its unique_task_id"""
     conn = Database.get_connection()
     cursor = conn.cursor()
@@ -766,6 +797,22 @@ def delete_all_failed_tasks(admin_id: int) -> Tuple[int, str]:
     conn.commit()
     
     return count, f"✅ Deleted {count} failed tasks successfully!"
+
+def delete_all_expired_tasks(admin_id: int) -> Tuple[int, str]:
+    """Delete all expired tasks"""
+    conn = Database.get_connection()
+    cursor = conn.cursor()
+    
+    cursor.execute('SELECT COUNT(*) FROM tasks WHERE status = "expired"')
+    count = cursor.fetchone()[0]
+    
+    if count == 0:
+        return 0, "📭 No expired tasks to delete!"
+    
+    cursor.execute('DELETE FROM tasks WHERE status = "expired"')
+    conn.commit()
+    
+    return count, f"✅ Deleted {count} expired tasks successfully!"
 
 # ==================== EMAIL ACCOUNT MANAGEMENT ====================
 def get_email_accounts() -> List[Dict]:
@@ -1367,36 +1414,6 @@ def delete_completed_task(task_id: int, admin_id: int) -> Tuple[bool, str]:
     conn.commit()
     
     return True, f"✅ Task #{task_id} deleted successfully!"
-
-def delete_all_completed_tasks(admin_id: int) -> Tuple[int, str]:
-    conn = Database.get_connection()
-    cursor = conn.cursor()
-    
-    cursor.execute('SELECT COUNT(*) FROM tasks WHERE status = "approved"')
-    count = cursor.fetchone()[0]
-    
-    if count == 0:
-        return 0, "No completed tasks to delete"
-    
-    cursor.execute('DELETE FROM tasks WHERE status = "approved"')
-    conn.commit()
-    
-    return count, f"✅ Deleted {count} completed tasks successfully!"
-
-def delete_all_failed_tasks(admin_id: int) -> Tuple[int, str]:
-    conn = Database.get_connection()
-    cursor = conn.cursor()
-    
-    cursor.execute('SELECT COUNT(*) FROM tasks WHERE status = "rejected"')
-    count = cursor.fetchone()[0]
-    
-    if count == 0:
-        return 0, "No failed tasks to delete"
-    
-    cursor.execute('DELETE FROM tasks WHERE status = "rejected"')
-    conn.commit()
-    
-    return count, f"✅ Deleted {count} failed tasks successfully!"
 
 def mark_task_for_otp(task_id: int, user_id: int):
     conn = Database.get_connection()
@@ -2256,18 +2273,22 @@ def get_admin_referral_menu():
     return ReplyKeyboardMarkup(buttons, resize_keyboard=True)
 
 def get_admin_delete_tasks_menu():
+    """Updated menu with separate buttons for Failed and Expired tasks"""
     buttons = [
         ["🗑️ Delete Single Completed Task"],
         ["🗑️ Delete All Completed Tasks"],
         ["🗑️ Delete All Failed Tasks"],
+        ["🗑️ Delete All Expired Tasks"],
         ["🔙 Back to Admin Settings"]
     ]
     return ReplyKeyboardMarkup(buttons, resize_keyboard=True)
 
 def get_admin_export_menu():
+    """Updated menu with Expired Tasks export option"""
     buttons = [
         ["📥 Export Completed Tasks"],
         ["📥 Export Failed Tasks"],
+        ["📥 Export Expired Tasks"],
         ["🔙 Back to Admin Menu"]
     ]
     return ReplyKeyboardMarkup(buttons, resize_keyboard=True)
@@ -2286,10 +2307,12 @@ def get_admin_settings_menu():
     return ReplyKeyboardMarkup(buttons, resize_keyboard=True)
 
 def get_delete_tasks_menu():
+    """Updated menu with separate buttons for Failed and Expired tasks"""
     buttons = [
         ["🗑️ Delete Single Completed Task"],
         ["🗑️ Delete All Completed Tasks"],
         ["🗑️ Delete All Failed Tasks"],
+        ["🗑️ Delete All Expired Tasks"],
         ["🔙 Back to Admin Settings"]
     ]
     return ReplyKeyboardMarkup(buttons, resize_keyboard=True)
@@ -2601,11 +2624,33 @@ async def handle_otp_cancel_task(update: Update, context: ContextTypes.DEFAULT_T
         await queue_message_for_deletion(user.id, sent_msg.message_id)
 
 async def handle_task_otp_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Fixed OTP input handler that properly checks for cancel/resend buttons"""
     user = update.effective_user
     message = update.message
-    otp = message.text.strip()
+    text = message.text.strip()
     
-    if not otp.isdigit() or len(otp) != 6:
+    # FIRST: Check for Cancel Task button during OTP phase
+    if text == "❌ Cancel Task":
+        await handle_otp_cancel_task(update, context)
+        return
+    
+    # SECOND: Check for Resend Code button
+    if text.startswith("📨 Resend Code"):
+        await handle_otp_resend(update, context)
+        return
+    
+    # THIRD: Check for Main Menu
+    if text == "🏠 Main Menu":
+        context.user_data.pop('awaiting_task_otp', None)
+        context.user_data.pop('otp_task_id', None)
+        await message.reply_text(
+            "Returning to main menu...",
+            reply_markup=get_main_menu(user.id)
+        )
+        return
+    
+    # FOURTH: Validate OTP format
+    if not text.isdigit() or len(text) != 6:
         sent_msg = await message.reply_text(
             "❌ Invalid code!\n\n"
             "Please enter the 6-digit verification code:",
@@ -2614,7 +2659,8 @@ async def handle_task_otp_input(update: Update, context: ContextTypes.DEFAULT_TY
         await queue_message_for_deletion(user.id, sent_msg.message_id)
         return
     
-    success, task_id, result = verify_task_otp(user.id, otp)
+    # FIFTH: Verify the OTP
+    success, task_id, result = verify_task_otp(user.id, text)
     
     if success and task_id:
         if submit_task_after_otp(task_id, user.id):
@@ -3944,7 +3990,7 @@ async def handle_admin_settings_menu(update: Update, context: ContextTypes.DEFAU
         reply_markup=get_admin_settings_menu()
     )
 
-# ==================== EXPORT TASKS HANDLERS ====================
+# ==================== EXPORT TASKS HANDLERS (FIXED) ====================
 async def handle_export_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     
@@ -3971,28 +4017,34 @@ async def handle_export_completed_tasks(update: Update, context: ContextTypes.DE
         )
         return
     
-    csv_data, count = export_completed_tasks_to_csv()
-    
-    if count == 0:
+    try:
+        csv_data, count = export_completed_tasks_to_csv()
+        
+        if count == 0:
+            await update.message.reply_text(
+                "📭 No completed tasks to export!",
+                reply_markup=get_admin_export_menu()
+            )
+            return
+        
+        filename = f"completed_tasks_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
+        
+        await context.bot.send_document(
+            chat_id=user.id,
+            document=csv_data,
+            filename=filename,
+            caption=f"✅ Completed Tasks Export\n📊 Total: {count} tasks\n📅 Exported: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
+        )
+        
         await update.message.reply_text(
-            "📭 No completed tasks to export!",
+            f"✅ Exported {count} completed tasks!",
             reply_markup=get_admin_export_menu()
         )
-        return
-    
-    filename = f"completed_tasks_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
-    
-    await context.bot.send_document(
-        chat_id=user.id,
-        document=csv_data,
-        filename=filename,
-        caption=f"✅ Completed Tasks Export\n📊 Total: {count} tasks\n📅 Exported: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
-    )
-    
-    await update.message.reply_text(
-        f"✅ Exported {count} completed tasks!",
-        reply_markup=get_admin_export_menu()
-    )
+    except Exception as e:
+        await update.message.reply_text(
+            f"❌ Error exporting tasks: {str(e)}",
+            reply_markup=get_admin_export_menu()
+        )
 
 async def handle_export_failed_tasks(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
@@ -4004,30 +4056,75 @@ async def handle_export_failed_tasks(update: Update, context: ContextTypes.DEFAU
         )
         return
     
-    csv_data, count = export_failed_tasks_to_csv()
-    
-    if count == 0:
+    try:
+        csv_data, count = export_failed_tasks_to_csv()
+        
+        if count == 0:
+            await update.message.reply_text(
+                "📭 No failed tasks to export!",
+                reply_markup=get_admin_export_menu()
+            )
+            return
+        
+        filename = f"failed_tasks_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
+        
+        await context.bot.send_document(
+            chat_id=user.id,
+            document=csv_data,
+            filename=filename,
+            caption=f"❌ Failed Tasks Export\n📊 Total: {count} tasks\n📅 Exported: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
+        )
+        
         await update.message.reply_text(
-            "📭 No failed tasks to export!",
+            f"✅ Exported {count} failed tasks!",
             reply_markup=get_admin_export_menu()
+        )
+    except Exception as e:
+        await update.message.reply_text(
+            f"❌ Error exporting tasks: {str(e)}",
+            reply_markup=get_admin_export_menu()
+        )
+
+async def handle_export_expired_tasks(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    
+    if not is_admin(user.id) or 'export' not in get_admin_permissions(user.id):
+        await update.message.reply_text(
+            "❌ You don't have permission to export tasks!",
+            reply_markup=get_admin_menu_by_permissions(user.id)
         )
         return
     
-    filename = f"failed_tasks_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
-    
-    await context.bot.send_document(
-        chat_id=user.id,
-        document=csv_data,
-        filename=filename,
-        caption=f"❌ Failed Tasks Export\n📊 Total: {count} tasks\n📅 Exported: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
-    )
-    
-    await update.message.reply_text(
-        f"✅ Exported {count} failed tasks!",
-        reply_markup=get_admin_export_menu()
-    )
+    try:
+        csv_data, count = export_expired_tasks_to_csv()
+        
+        if count == 0:
+            await update.message.reply_text(
+                "📭 No expired tasks to export!",
+                reply_markup=get_admin_export_menu()
+            )
+            return
+        
+        filename = f"expired_tasks_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
+        
+        await context.bot.send_document(
+            chat_id=user.id,
+            document=csv_data,
+            filename=filename,
+            caption=f"💀 Expired Tasks Export\n📊 Total: {count} tasks\n📅 Exported: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
+        )
+        
+        await update.message.reply_text(
+            f"✅ Exported {count} expired tasks!",
+            reply_markup=get_admin_export_menu()
+        )
+    except Exception as e:
+        await update.message.reply_text(
+            f"❌ Error exporting tasks: {str(e)}",
+            reply_markup=get_admin_export_menu()
+        )
 
-# ==================== DELETE TASKS HANDLERS ====================
+# ==================== DELETE TASKS HANDLERS (FIXED) ====================
 async def handle_delete_tasks_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     
@@ -4091,6 +4188,23 @@ async def handle_delete_all_failed_tasks(update: Update, context: ContextTypes.D
         return
     
     count, msg = delete_all_failed_tasks(user.id)
+    
+    await update.message.reply_text(
+        msg,
+        reply_markup=get_admin_delete_tasks_menu()
+    )
+
+async def handle_delete_all_expired_tasks(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    
+    if not is_admin(user.id) or 'delete' not in get_admin_permissions(user.id):
+        await update.message.reply_text(
+            "❌ You don't have permission to delete tasks!",
+            reply_markup=get_admin_menu_by_permissions(user.id)
+        )
+        return
+    
+    count, msg = delete_all_expired_tasks(user.id)
     
     await update.message.reply_text(
         msg,
@@ -5660,7 +5774,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await queue_message_for_deletion(user.id, message.message_id)
     update_user_activity(user.id)
     
-    # Handle OTP input for task completion
+    # Handle OTP input for task completion - FIXED: Check for cancel/resend first inside the function
     if 'awaiting_task_otp' in context.user_data:
         await handle_task_otp_input(update, context)
         return
@@ -6486,12 +6600,20 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await handle_delete_all_failed_tasks(update, context)
             return
             
+        elif text == "🗑️ Delete All Expired Tasks" and 'delete' in permissions:
+            await handle_delete_all_expired_tasks(update, context)
+            return
+            
         elif text == "📥 Export Completed Tasks" and 'export' in permissions:
             await handle_export_completed_tasks(update, context)
             return
             
         elif text == "📥 Export Failed Tasks" and 'export' in permissions:
             await handle_export_failed_tasks(update, context)
+            return
+            
+        elif text == "📥 Export Expired Tasks" and 'export' in permissions:
+            await handle_export_expired_tasks(update, context)
             return
             
         elif text == "💰 Edit Referral Bonus" and 'referral' in permissions:
@@ -7131,10 +7253,10 @@ def main():
     logger.info(f"⚙️ Max active tasks per user: {MAX_ACTIVE_TASKS}")
     logger.info(f"📦 Max bulk tasks: {MAX_BULK_TASKS}")
     logger.info("✅ Referral: Uses User ID as referral code")
-    logger.info("✅ Cancel Buttons: Working during OTP phase")
+    logger.info("✅ Cancel Buttons: Working during OTP phase (FIXED)")
     logger.info("✅ Payout Images: Sent to user and posted to channel")
-    logger.info("✅ Delete Tasks: Single completed, all completed, all failed")
-    logger.info("✅ Export Tasks: CSV with Name, Father Name, Email, Password")
+    logger.info("✅ Delete Tasks: Single completed, all completed, all failed, all expired (FIXED)")
+    logger.info("✅ Export Tasks: CSV with Name, Father Name, Email, Password (FIXED)")
     logger.info("✅ Auto Delete Messages: All messages deleted after 72 hours")
     logger.info("✅ Referral Settings: Admin can edit bonus and percentage")
     logger.info("✅ Milestone Bonuses: Admin can enable/disable and broadcast")
