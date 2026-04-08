@@ -31,7 +31,7 @@ except ImportError:
     print("⚠️ openpyxl not installed. Install with: pip install openpyxl")
 
 # ==================== CONFIGURATION ====================
-BOT_TOKEN = "8302342021:AAHr9jDRK-yGqxodl0lCMadEP4u3N0xQK8A"
+BOT_TOKEN = "8302342021:AAF8DFEuQ_m15D_7GZLpmwOPrBE35-9xLWk"
 BOT_NAME = "Ethio Farmer"
 OWNER_ID = 8360602913
 ADMIN_IDS = [8360602913]
