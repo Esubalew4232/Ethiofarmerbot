@@ -22,7 +22,7 @@ import shutil
 import re
 
 # ==================== CONFIGURATION ====================
-BOT_TOKEN = "8689460331:AAFrU_SN5i394wD7AjX3DbwrqcaAb5CUjzg"
+BOT_TOKEN = "8788302427:AAE_hL1dBYwzS-R7cBXZ_z2f7qGgTlHeRdE"
 BOT_NAME = "Ethio Farmer"
 OWNER_ID = 8360602913
 ADMIN_IDS = [8360602913]
