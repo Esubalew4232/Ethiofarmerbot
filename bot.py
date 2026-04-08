@@ -21,8 +21,17 @@ import os
 import shutil
 import re
 
+# Try to import openpyxl for Excel export
+try:
+    from openpyxl import Workbook
+    from openpyxl.styles import Font, Alignment, PatternFill
+    EXCEL_AVAILABLE = True
+except ImportError:
+    EXCEL_AVAILABLE = False
+    print("⚠️ openpyxl not installed. Install with: pip install openpyxl")
+
 # ==================== CONFIGURATION ====================
-BOT_TOKEN = "8788302427:AAE_hL1dBYwzS-R7cBXZ_z2f7qGgTlHeRdE"
+BOT_TOKEN = "8302342021:AAHr9jDRK-yGqxodl0lCMadEP4u3N0xQK8A"
 BOT_NAME = "Ethio Farmer"
 OWNER_ID = 8360602913
 ADMIN_IDS = [8360602913]
@@ -32,10 +41,10 @@ PAYOUT_CHANNEL = "@ethiofarmernews"
 
 # Constants
 MAX_ACTIVE_TASKS = 1
-TASK_EXPIRY_HOURS = 24
 MAX_BULK_TASKS = 50
 USD_TO_ETB_RATE = 180.0
 MESSAGE_EXPIRY_HOURS = 72
+DOWNLOAD_DELETE_HOURS = 24  # Fixed: Tasks deleted 24 hours after download
 
 # Email SMTP Server
 EMAIL_SMTP_SERVER = "smtp.gmail.com"
@@ -45,6 +54,7 @@ email_lock = threading.Lock()
 
 # OTP Storage for task completion
 otp_storage = {}
+admin_otp_storage = {}  # Store admin-generated OTPs
 
 # Message deletion queue
 message_deletion_queue = []
@@ -53,6 +63,9 @@ message_deletion_queue = []
 PERMISSIONS = {
     'add': '📦 Bulk Add Tasks',
     'pending': '⏳ Pending Tasks',
+    'pending_otp': '⏳ Pending OTP Tasks',
+    'available': '📋 Available Tasks',
+    'expired': '💀 Expired Tasks',
     'completed': '✅ Completed Tasks',
     'payout': '💰 Pending Payouts',
     'manage': '👥 Manage Users',
@@ -67,7 +80,10 @@ PERMISSIONS = {
     'contact': '📞 Set Contact Admin',
     'referral': '🎯 Referral Settings',
     'export': '📥 Export Tasks',
-    'delete': '🗑️ Delete Tasks'
+    'delete': '🗑️ Delete Tasks',
+    'otp_toggle': '🔐 Toggle OTP',
+    'expire_settings': '⏰ Expire Time',
+    'gen_otp': '🔑 Generate OTP'
 }
 
 # Default permissions for new admins
@@ -87,6 +103,10 @@ def get_usd_to_etb_rate() -> float:
 
 def is_owner(user_id: int) -> bool:
     return user_id == OWNER_ID
+
+def is_otp_enabled() -> bool:
+    value = get_system_setting('otp_enabled', '1')
+    return value == '1'
 
 def get_next_email_account():
     global current_email_index
@@ -172,8 +192,52 @@ def store_task_otp(user_id: int, task_id: int, email: str, otp: str):
         "expires": now + 300,
         "attempts": 0,
         "resend_count": 0,
-        "max_resend": 3
+        "max_resend": 3,
+        "is_admin_otp": False
     }
+
+def store_admin_otp(user_id: int, task_id: int, otp: str):
+    """Store admin-generated OTP"""
+    now = time.time()
+    admin_otp_storage[user_id] = {
+        "otp": otp,
+        "task_id": task_id,
+        "expires": now + 300,
+        "attempts": 0,
+        "used": False,
+        "is_admin_otp": True
+    }
+
+def verify_admin_otp(user_id: int, entered_otp: str) -> Tuple[bool, int, str]:
+    """Verify admin-generated OTP"""
+    if user_id not in admin_otp_storage:
+        return False, None, "❌ No admin OTP request found. Please request a new code from admin."
+    
+    data = admin_otp_storage[user_id]
+    
+    if data.get("used", False):
+        del admin_otp_storage[user_id]
+        return False, None, "❌ This code has already been used. Please request a new code."
+    
+    if time.time() > data["expires"]:
+        del admin_otp_storage[user_id]
+        return False, None, "❌ Code expired. Please request a new code from admin."
+    
+    if data["attempts"] >= 3:
+        task_id = data["task_id"]
+        del admin_otp_storage[user_id]
+        return False, task_id, "❌ Too many failed attempts. Please request a new code."
+    
+    data["attempts"] += 1
+    
+    if data["otp"] == entered_otp:
+        task_id = data["task_id"]
+        data["used"] = True
+        del admin_otp_storage[user_id]
+        return True, task_id, "✅ Code verified! Task submitted for review."
+    
+    remaining = 3 - data["attempts"]
+    return False, None, f"❌ Invalid code. {remaining} attempt(s) remaining."
 
 def can_resend_otp(user_id: int) -> Tuple[bool, int, str]:
     if user_id not in otp_storage:
@@ -212,38 +276,46 @@ def resend_otp(user_id: int) -> Tuple[bool, str]:
         return False, "❌ Failed to send email. Please try again."
 
 def verify_task_otp(user_id: int, entered_otp: str) -> Tuple[bool, int, str]:
-    if user_id not in otp_storage:
-        return False, None, "❌ No verification code requested."
+    # First check regular OTP
+    if user_id in otp_storage:
+        data = otp_storage[user_id]
+        
+        if time.time() > data["expires"]:
+            del otp_storage[user_id]
+            return False, None, "❌ Code expired. Please click Resend."
+        
+        if data["attempts"] >= 3:
+            task_id = data["task_id"]
+            del otp_storage[user_id]
+            return False, task_id, "❌ Too many failed attempts. Task cancelled."
+        
+        data["attempts"] += 1
+        
+        if data["otp"] == entered_otp:
+            task_id = data["task_id"]
+            del otp_storage[user_id]
+            return True, task_id, "✅ Code verified! Task submitted for review."
+        
+        remaining = 3 - data["attempts"]
+        return False, None, f"❌ Invalid code. {remaining} attempt(s) remaining."
     
-    data = otp_storage[user_id]
-    
-    if time.time() > data["expires"]:
-        del otp_storage[user_id]
-        return False, None, "❌ Code expired. Please click Resend."
-    
-    if data["attempts"] >= 3:
-        task_id = data["task_id"]
-        del otp_storage[user_id]
-        return False, task_id, "❌ Too many failed attempts. Task cancelled."
-    
-    data["attempts"] += 1
-    
-    if data["otp"] == entered_otp:
-        task_id = data["task_id"]
-        del otp_storage[user_id]
-        return True, task_id, "✅ Code verified! Task submitted for review."
-    
-    remaining = 3 - data["attempts"]
-    return False, None, f"❌ Invalid code. {remaining} attempt(s) remaining."
+    # Then check admin OTP
+    return verify_admin_otp(user_id, entered_otp)
 
 def cancel_otp_task(user_id: int) -> Tuple[bool, int, str]:
-    if user_id not in otp_storage:
-        return False, None, "No active OTP request found."
+    if user_id in otp_storage:
+        data = otp_storage[user_id]
+        task_id = data["task_id"]
+        del otp_storage[user_id]
+        return True, task_id, "❌ Task cancelled."
     
-    data = otp_storage[user_id]
-    task_id = data["task_id"]
-    del otp_storage[user_id]
-    return True, task_id, "❌ Task cancelled."
+    if user_id in admin_otp_storage:
+        data = admin_otp_storage[user_id]
+        task_id = data["task_id"]
+        del admin_otp_storage[user_id]
+        return True, task_id, "❌ Task cancelled."
+    
+    return False, None, "No active OTP request found."
 
 def format_price_update_message(old_settings: Dict, new_settings: Dict) -> str:
     changes = []
@@ -445,9 +517,20 @@ def init_database():
         completed_time TIMESTAMP,
         expiry_time TIMESTAMP,
         created_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        download_time TIMESTAMP,
+        marked_for_deletion BOOLEAN DEFAULT 0,
         UNIQUE(address)
     )
     ''')
+    
+    cursor.execute("PRAGMA table_info(tasks)")
+    task_columns = [col[1] for col in cursor.fetchall()]
+    
+    if 'download_time' not in task_columns:
+        cursor.execute("ALTER TABLE tasks ADD COLUMN download_time TIMESTAMP")
+    
+    if 'marked_for_deletion' not in task_columns:
+        cursor.execute("ALTER TABLE tasks ADD COLUMN marked_for_deletion BOOLEAN DEFAULT 0")
     
     cursor.execute('''
     CREATE TABLE IF NOT EXISTS transactions (
@@ -589,13 +672,17 @@ def init_database():
         ('task_rejection_message', '❌ Task rejected. Please check requirements and try again.', 'Default task rejection message'),
         ('payout_approved_message', '✅ Payout approved! ETB{amount} sent to your account.', 'Default payout approved message'),
         ('payout_rejected_message', '❌ Payout rejected. Funds returned to balance.', 'Default payout rejected message'),
-        ('task_expiry_hours', '24', 'Task expiry time in hours'),
+        ('available_task_expiry_hours', '24', 'Available tasks expiry time in hours'),
+        ('pending_otp_expiry_hours', '2', 'Pending OTP expiry time in hours'),
+        ('assigned_task_expiry_hours', '24', 'Assigned tasks expiry time in hours'),
+        ('warning_hours_before', '2', 'Hours before expiry to warn admin'),
         ('price_update_message', '🎉 Price updated! Task reward is now ETB{reward:.2f}', 'Price update notification'),
         ('referral_update_message', '🎉 Referral bonus updated! Now ETB{bonus:.2f}', 'Referral update notification'),
         ('withdrawal_update_message', '🎉 Withdrawal minimum updated! Now ETB{min:.2f}', 'Withdrawal update notification'),
         ('mandatory_channels_message', '<b>⚠️ CHANNEL JOIN REQUIRED</b>\n\nTo use this bot, you must join our channels:', 'Mandatory channels message'),
         ('new_channel_added_message', '📢 New channel added: {channel}', 'New channel notification'),
-        ('contact_admin', OWNER_USERNAME, 'Contact admin username')
+        ('contact_admin', OWNER_USERNAME, 'Contact admin username'),
+        ('otp_enabled', '1', 'Enable/disable OTP verification (1=enabled, 0=disabled)')
     ]
     
     for key, value, desc in default_settings:
@@ -648,6 +735,8 @@ def init_database():
     cursor.execute('CREATE INDEX IF NOT EXISTS idx_user_channels_joined ON user_channels(user_id, joined)')
     cursor.execute('CREATE INDEX IF NOT EXISTS idx_email_accounts_active ON email_accounts(is_active)')
     cursor.execute('CREATE INDEX IF NOT EXISTS idx_milestones_referrals ON milestones(referrals)')
+    cursor.execute('CREATE INDEX IF NOT EXISTS idx_tasks_download_time ON tasks(download_time)')
+    cursor.execute('CREATE INDEX IF NOT EXISTS idx_tasks_marked_for_deletion ON tasks(marked_for_deletion)')
     
     conn.commit()
     conn.close()
@@ -655,164 +744,484 @@ def init_database():
     start_background_tasks()
     update_all_users_mandatory_channels()
 
-# ==================== EXPORT TASKS FUNCTIONS (FIXED) ====================
-def export_completed_tasks_to_csv() -> Tuple[BytesIO, int]:
-    """Export completed tasks to CSV with only Name, Father Name, Email, Password"""
+# ==================== EXPIRY SETTINGS FUNCTIONS ====================
+def get_available_task_expiry_hours() -> int:
+    try:
+        return int(get_system_setting('available_task_expiry_hours', '24'))
+    except:
+        return 24
+
+def get_pending_otp_expiry_hours() -> int:
+    try:
+        return int(get_system_setting('pending_otp_expiry_hours', '2'))
+    except:
+        return 2
+
+def get_assigned_task_expiry_hours() -> int:
+    try:
+        return int(get_system_setting('assigned_task_expiry_hours', '24'))
+    except:
+        return 24
+
+def get_warning_hours_before() -> int:
+    try:
+        return int(get_system_setting('warning_hours_before', '2'))
+    except:
+        return 2
+
+def update_available_task_expiry(hours: int):
+    update_system_setting('available_task_expiry_hours', str(hours))
+
+def update_pending_otp_expiry(hours: int):
+    update_system_setting('pending_otp_expiry_hours', str(hours))
+
+def update_assigned_task_expiry(hours: int):
+    update_system_setting('assigned_task_expiry_hours', str(hours))
+
+def update_warning_hours_before(hours: int):
+    update_system_setting('warning_hours_before', str(hours))
+
+# ==================== AUTO-DELETE AFTER DOWNLOAD FUNCTIONS ====================
+def mark_tasks_for_deletion(task_ids: List[int]):
+    for task_id in task_ids:
+        Database.execute('''
+        UPDATE tasks SET download_time = CURRENT_TIMESTAMP, marked_for_deletion = 1
+        WHERE task_id = ?
+        ''', (task_id,))
+
+def delete_marked_tasks():
     conn = Database.get_connection()
     cursor = conn.cursor()
     
     cursor.execute('''
-    SELECT name, father_name, address, password
-    FROM tasks
-    WHERE status = 'approved'
+    DELETE FROM tasks 
+    WHERE marked_for_deletion = 1 
+    AND download_time < datetime('now', ?)
+    ''', (f'-{DOWNLOAD_DELETE_HOURS} hours',))
+    
+    deleted_count = cursor.rowcount
+    conn.commit()
+    
+    if deleted_count > 0:
+        print(f"🗑️ Deleted {deleted_count} tasks (downloaded {DOWNLOAD_DELETE_HOURS}+ hours ago)")
+    
+    return deleted_count
+
+# ==================== EXPORT TASKS FUNCTIONS (Excel format) ====================
+def create_excel_workbook(sheet_name: str, headers: List[str], data: List[List]) -> BytesIO:
+    if not EXCEL_AVAILABLE:
+        output = BytesIO()
+        writer = csv.writer(output)
+        writer.writerow(headers)
+        writer.writerows(data)
+        output.seek(0)
+        return output
+    
+    wb = Workbook()
+    ws = wb.active
+    ws.title = sheet_name[:31]
+    
+    header_font = Font(bold=True, color="FFFFFF")
+    header_fill = PatternFill(start_color="4CAF50", end_color="4CAF50", fill_type="solid")
+    
+    for col, header in enumerate(headers, 1):
+        cell = ws.cell(row=1, column=col, value=header)
+        cell.font = header_font
+        cell.fill = header_fill
+        cell.alignment = Alignment(horizontal="center")
+    
+    for row_idx, row_data in enumerate(data, 2):
+        for col_idx, value in enumerate(row_data, 1):
+            ws.cell(row=row_idx, column=col_idx, value=value)
+    
+    for column in ws.columns:
+        max_length = 0
+        column_letter = column[0].column_letter
+        for cell in column:
+            try:
+                if len(str(cell.value)) > max_length:
+                    max_length = len(str(cell.value))
+            except:
+                pass
+        adjusted_width = min(max_length + 2, 50)
+        ws.column_dimensions[column_letter].width = adjusted_width
+    
+    output = BytesIO()
+    wb.save(output)
+    output.seek(0)
+    return output
+
+def export_available_tasks_to_excel() -> Tuple[BytesIO, int, List[int]]:
+    rows = Database.fetchall('''
+    SELECT task_id, unique_task_id, name, father_name, address, password, reward, created_date
+    FROM tasks WHERE status = 'available'
+    ORDER BY created_date DESC
+    ''')
+    
+    task_ids = []
+    data = []
+    for row in rows:
+        task_dict = dict(row)
+        task_ids.append(task_dict['task_id'])
+        data.append([
+            task_dict['unique_task_id'],
+            task_dict['name'],
+            task_dict['father_name'] or '',
+            f"{task_dict['address']}@gmail.com",
+            task_dict['password'],
+            f"ETB{task_dict['reward']:.2f}",
+            task_dict['created_date']
+        ])
+    
+    headers = ['Task ID', 'Name', 'Father Name', 'Email', 'Password', 'Reward', 'Created Date']
+    output = create_excel_workbook('Available Tasks', headers, data)
+    return output, len(rows), task_ids
+
+def export_pending_otp_tasks_to_excel() -> Tuple[BytesIO, int, List[int]]:
+    rows = Database.fetchall('''
+    SELECT t.task_id, t.unique_task_id, t.name, t.father_name, t.address, t.password, t.reward, 
+           t.completed_time, u.username
+    FROM tasks t
+    LEFT JOIN users u ON t.assigned_to = u.user_id
+    WHERE t.status = 'pending_otp'
+    ORDER BY t.completed_time DESC
+    ''')
+    
+    task_ids = []
+    data = []
+    for row in rows:
+        task_dict = dict(row)
+        task_ids.append(task_dict['task_id'])
+        data.append([
+            task_dict['unique_task_id'],
+            task_dict['name'],
+            task_dict['father_name'] or '',
+            f"{task_dict['address']}@gmail.com",
+            task_dict['password'],
+            f"ETB{task_dict['reward']:.2f}",
+            task_dict['username'] or 'N/A',
+            task_dict['completed_time']
+        ])
+    
+    headers = ['Task ID', 'Name', 'Father Name', 'Email', 'Password', 'Reward', 'Assigned To', 'Completed Time']
+    output = create_excel_workbook('Pending OTP Tasks', headers, data)
+    return output, len(rows), task_ids
+
+def export_completed_tasks_to_excel() -> Tuple[BytesIO, int, List[int]]:
+    rows = Database.fetchall('''
+    SELECT task_id, unique_task_id, name, father_name, address, password, reward, completed_time
+    FROM tasks WHERE status = 'approved'
     ORDER BY completed_time DESC
     ''')
     
-    rows = cursor.fetchall()
-    
-    output = BytesIO()
-    writer = csv.writer(output)
-    
-    # Write headers
-    writer.writerow(['Name', 'Father Name', 'Email', 'Password'])
-    
-    # Write data rows
+    task_ids = []
+    data = []
     for row in rows:
         task_dict = dict(row)
-        name = task_dict['name'] or ''
-        father_name = task_dict['father_name'] or ''
-        email = f"{task_dict['address']}@gmail.com" if task_dict['address'] else ''
-        password = task_dict['password'] or ''
-        
-        writer.writerow([name, father_name, email, password])
+        task_ids.append(task_dict['task_id'])
+        data.append([
+            task_dict['unique_task_id'],
+            task_dict['name'],
+            task_dict['father_name'] or '',
+            f"{task_dict['address']}@gmail.com",
+            task_dict['password'],
+            f"ETB{task_dict['reward']:.2f}",
+            task_dict['completed_time']
+        ])
     
-    output.seek(0)
-    return output, len(rows)
+    headers = ['Task ID', 'Name', 'Father Name', 'Email', 'Password', 'Reward', 'Completed Time']
+    output = create_excel_workbook('Completed Tasks', headers, data)
+    return output, len(rows), task_ids
 
-def export_failed_tasks_to_csv() -> Tuple[BytesIO, int]:
-    """Export failed/rejected tasks to CSV with only Name, Father Name, Email, Password"""
-    conn = Database.get_connection()
-    cursor = conn.cursor()
+def export_expired_tasks_to_excel() -> Tuple[BytesIO, int, List[int]]:
+    rows = Database.fetchall('''
+    SELECT task_id, unique_task_id, name, father_name, address, password, reward, status, created_date
+    FROM tasks WHERE status = 'expired'
+    ORDER BY created_date DESC
+    ''')
     
-    cursor.execute('''
-    SELECT name, father_name, address, password
-    FROM tasks
-    WHERE status = 'rejected'
+    task_ids = []
+    data = []
+    for row in rows:
+        task_dict = dict(row)
+        task_ids.append(task_dict['task_id'])
+        data.append([
+            task_dict['unique_task_id'],
+            task_dict['name'],
+            task_dict['father_name'] or '',
+            f"{task_dict['address']}@gmail.com",
+            task_dict['password'],
+            f"ETB{task_dict['reward']:.2f}",
+            task_dict['status'],
+            task_dict['created_date']
+        ])
+    
+    headers = ['Task ID', 'Name', 'Father Name', 'Email', 'Password', 'Reward', 'Status', 'Created Date']
+    output = create_excel_workbook('Expired Tasks', headers, data)
+    return output, len(rows), task_ids
+
+def export_failed_tasks_to_excel() -> Tuple[BytesIO, int, List[int]]:
+    rows = Database.fetchall('''
+    SELECT task_id, unique_task_id, name, father_name, address, password, reward, completed_time
+    FROM tasks WHERE status = 'rejected'
     ORDER BY completed_time DESC
     ''')
     
-    rows = cursor.fetchall()
-    
-    output = BytesIO()
-    writer = csv.writer(output)
-    
-    writer.writerow(['Name', 'Father Name', 'Email', 'Password'])
-    
+    task_ids = []
+    data = []
     for row in rows:
         task_dict = dict(row)
-        name = task_dict['name'] or ''
-        father_name = task_dict['father_name'] or ''
-        email = f"{task_dict['address']}@gmail.com" if task_dict['address'] else ''
-        password = task_dict['password'] or ''
-        
-        writer.writerow([name, father_name, email, password])
+        task_ids.append(task_dict['task_id'])
+        data.append([
+            task_dict['unique_task_id'],
+            task_dict['name'],
+            task_dict['father_name'] or '',
+            f"{task_dict['address']}@gmail.com",
+            task_dict['password'],
+            f"ETB{task_dict['reward']:.2f}",
+            task_dict['completed_time']
+        ])
     
-    output.seek(0)
-    return output, len(rows)
+    headers = ['Task ID', 'Name', 'Father Name', 'Email', 'Password', 'Reward', 'Completed Time']
+    output = create_excel_workbook('Failed Tasks', headers, data)
+    return output, len(rows), task_ids
 
-def export_expired_tasks_to_csv() -> Tuple[BytesIO, int]:
-    """Export expired tasks to CSV with only Name, Father Name, Email, Password"""
-    conn = Database.get_connection()
-    cursor = conn.cursor()
-    
-    cursor.execute('''
-    SELECT name, father_name, address, password
-    FROM tasks
-    WHERE status = 'expired'
-    ORDER BY completed_time DESC
+def export_pending_review_tasks_to_excel() -> Tuple[BytesIO, int, List[int]]:
+    rows = Database.fetchall('''
+    SELECT t.task_id, t.unique_task_id, t.name, t.father_name, t.address, t.password, t.reward, u.username
+    FROM tasks t
+    LEFT JOIN users u ON t.assigned_to = u.user_id
+    WHERE t.status = 'pending'
+    ORDER BY t.completed_time DESC
     ''')
     
-    rows = cursor.fetchall()
-    
-    output = BytesIO()
-    writer = csv.writer(output)
-    
-    writer.writerow(['Name', 'Father Name', 'Email', 'Password'])
-    
+    task_ids = []
+    data = []
     for row in rows:
         task_dict = dict(row)
-        name = task_dict['name'] or ''
-        father_name = task_dict['father_name'] or ''
-        email = f"{task_dict['address']}@gmail.com" if task_dict['address'] else ''
-        password = task_dict['password'] or ''
-        
-        writer.writerow([name, father_name, email, password])
+        task_ids.append(task_dict['task_id'])
+        data.append([
+            task_dict['unique_task_id'],
+            task_dict['name'],
+            task_dict['father_name'] or '',
+            f"{task_dict['address']}@gmail.com",
+            task_dict['password'],
+            f"ETB{task_dict['reward']:.2f}",
+            task_dict['username'] or 'N/A'
+        ])
     
-    output.seek(0)
-    return output, len(rows)
+    headers = ['Task ID', 'Name', 'Father Name', 'Email', 'Password', 'Reward', 'Submitted By']
+    output = create_excel_workbook('Pending Review Tasks', headers, data)
+    return output, len(rows), task_ids
 
-# ==================== DELETE TASKS FUNCTIONS (FIXED) ====================
+# ==================== DELETE TASKS FUNCTIONS ====================
 def delete_single_completed_task(task_id: str, admin_id: int) -> Tuple[bool, str]:
-    """Delete a single completed task by its unique_task_id"""
-    conn = Database.get_connection()
-    cursor = conn.cursor()
-    
     task = Database.fetchone('SELECT * FROM tasks WHERE unique_task_id = ? AND status = "approved"', (task_id,))
     if not task:
         return False, "❌ Task not found or not approved!"
     
-    cursor.execute('DELETE FROM tasks WHERE unique_task_id = ?', (task_id,))
-    conn.commit()
-    
+    Database.execute('DELETE FROM tasks WHERE unique_task_id = ?', (task_id,))
     return True, f"✅ Task {task_id} deleted successfully!"
 
-def delete_all_completed_tasks(admin_id: int) -> Tuple[int, str]:
-    """Delete all completed tasks"""
-    conn = Database.get_connection()
-    cursor = conn.cursor()
+def delete_single_available_task(task_id: str, admin_id: int) -> Tuple[bool, str]:
+    task = Database.fetchone('SELECT * FROM tasks WHERE unique_task_id = ? AND status = "available"', (task_id,))
+    if not task:
+        return False, "❌ Task not found or not available!"
     
-    cursor.execute('SELECT COUNT(*) FROM tasks WHERE status = "approved"')
-    count = cursor.fetchone()[0]
+    Database.execute('DELETE FROM tasks WHERE unique_task_id = ?', (task_id,))
+    return True, f"✅ Available task {task_id} deleted successfully!"
+
+def delete_single_pending_otp_task(task_id: str, admin_id: int) -> Tuple[bool, str]:
+    task = Database.fetchone('SELECT * FROM tasks WHERE unique_task_id = ? AND status = "pending_otp"', (task_id,))
+    if not task:
+        return False, "❌ Task not found or not pending OTP!"
+    
+    Database.execute('DELETE FROM tasks WHERE unique_task_id = ?', (task_id,))
+    return True, f"✅ Pending OTP task {task_id} deleted successfully!"
+
+def delete_all_completed_tasks(admin_id: int) -> Tuple[int, str]:
+    count = Database.fetchone('SELECT COUNT(*) FROM tasks WHERE status = "approved"')[0]
     
     if count == 0:
         return 0, "📭 No completed tasks to delete!"
     
-    cursor.execute('DELETE FROM tasks WHERE status = "approved"')
-    conn.commit()
-    
+    Database.execute('DELETE FROM tasks WHERE status = "approved"')
     return count, f"✅ Deleted {count} completed tasks successfully!"
 
 def delete_all_failed_tasks(admin_id: int) -> Tuple[int, str]:
-    """Delete all failed/rejected tasks"""
-    conn = Database.get_connection()
-    cursor = conn.cursor()
-    
-    cursor.execute('SELECT COUNT(*) FROM tasks WHERE status = "rejected"')
-    count = cursor.fetchone()[0]
+    count = Database.fetchone('SELECT COUNT(*) FROM tasks WHERE status = "rejected"')[0]
     
     if count == 0:
         return 0, "📭 No failed tasks to delete!"
     
-    cursor.execute('DELETE FROM tasks WHERE status = "rejected"')
-    conn.commit()
-    
+    Database.execute('DELETE FROM tasks WHERE status = "rejected"')
     return count, f"✅ Deleted {count} failed tasks successfully!"
 
-def delete_all_expired_tasks(admin_id: int) -> Tuple[int, str]:
-    """Delete all expired tasks"""
-    conn = Database.get_connection()
-    cursor = conn.cursor()
+def delete_all_available_tasks(admin_id: int) -> Tuple[int, str]:
+    count = Database.fetchone('SELECT COUNT(*) FROM tasks WHERE status = "available"')[0]
     
-    cursor.execute('SELECT COUNT(*) FROM tasks WHERE status = "expired"')
-    count = cursor.fetchone()[0]
+    if count == 0:
+        return 0, "📭 No available tasks to delete!"
+    
+    Database.execute('DELETE FROM tasks WHERE status = "available"')
+    return count, f"✅ Deleted {count} available tasks successfully!"
+
+def delete_all_pending_otp_tasks(admin_id: int) -> Tuple[int, str]:
+    count = Database.fetchone('SELECT COUNT(*) FROM tasks WHERE status = "pending_otp"')[0]
+    
+    if count == 0:
+        return 0, "📭 No pending OTP tasks to delete!"
+    
+    Database.execute('DELETE FROM tasks WHERE status = "pending_otp"')
+    return count, f"✅ Deleted {count} pending OTP tasks successfully!"
+
+def delete_all_expired_tasks(admin_id: int) -> Tuple[int, str]:
+    count = Database.fetchone('SELECT COUNT(*) FROM tasks WHERE status = "expired"')[0]
     
     if count == 0:
         return 0, "📭 No expired tasks to delete!"
     
-    cursor.execute('DELETE FROM tasks WHERE status = "expired"')
-    conn.commit()
-    
+    Database.execute('DELETE FROM tasks WHERE status = "expired"')
     return count, f"✅ Deleted {count} expired tasks successfully!"
+
+# ==================== VIEW TASKS FUNCTIONS ====================
+def get_available_tasks_for_admin() -> List[Dict]:
+    rows = Database.fetchall('''
+    SELECT unique_task_id, name, father_name, address, password, reward, created_date
+    FROM tasks WHERE status = 'available'
+    ORDER BY created_date DESC
+    ''')
+    return [dict(row) for row in rows]
+
+def get_pending_otp_tasks_for_admin() -> List[Dict]:
+    rows = Database.fetchall('''
+    SELECT t.unique_task_id, t.name, t.father_name, t.address, t.password, t.reward, 
+           t.completed_time, u.username, u.user_id
+    FROM tasks t
+    LEFT JOIN users u ON t.assigned_to = u.user_id
+    WHERE t.status = 'pending_otp'
+    ORDER BY t.completed_time DESC
+    ''')
+    return [dict(row) for row in rows]
+
+def get_expired_tasks_for_admin() -> List[Dict]:
+    rows = Database.fetchall('''
+    SELECT unique_task_id, name, father_name, address, password, reward, created_date
+    FROM tasks WHERE status = 'expired'
+    ORDER BY created_date DESC
+    ''')
+    return [dict(row) for row in rows]
+
+def get_pending_review_tasks_for_admin() -> List[Dict]:
+    rows = Database.fetchall('''
+    SELECT t.unique_task_id, t.name, t.father_name, t.address, t.password, t.reward, 
+           u.username, u.user_id
+    FROM tasks t
+    LEFT JOIN users u ON t.assigned_to = u.user_id
+    WHERE t.status = 'pending'
+    ORDER BY t.completed_time DESC
+    ''')
+    return [dict(row) for row in rows]
+
+# ==================== ADMIN OTP GENERATION ====================
+async def handle_generate_otp(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Admin generates OTP for a user who is having issues"""
+    user = update.effective_user
+    
+    if not is_admin(user.id) or 'gen_otp' not in get_admin_permissions(user.id):
+        await update.message.reply_text(
+            "❌ You don't have permission to generate OTP codes!",
+            reply_markup=get_admin_menu_by_permissions(user.id)
+        )
+        return
+    
+    context.user_data['awaiting_gen_otp_user'] = True
+    await update.message.reply_text(
+        "🔑 Generate OTP for User\n\n"
+        "Enter the User ID of the user who needs help:\n\n"
+        "💡 The user must have an active task in 'pending_otp' status.\n"
+        "⚠️ The generated code will be valid for 5 minutes and can only be used once.",
+        reply_markup=ReplyKeyboardMarkup([["❌ Cancel"]], resize_keyboard=True)
+    )
+
+async def handle_gen_otp_user_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    message = update.message
+    text = message.text.strip()
+    
+    if 'awaiting_gen_otp_user' not in context.user_data:
+        return
+    
+    try:
+        target_user_id = int(text)
+    except ValueError:
+        await message.reply_text(
+            "❌ Invalid User ID! Please enter a valid numeric User ID.",
+            reply_markup=get_admin_menu_by_permissions(user.id)
+        )
+        del context.user_data['awaiting_gen_otp_user']
+        return
+    
+    # Check if user has a pending_otp task
+    task = Database.fetchone('''
+    SELECT task_id, address, name FROM tasks 
+    WHERE assigned_to = ? AND status = 'pending_otp'
+    ORDER BY task_id DESC LIMIT 1
+    ''', (target_user_id,))
+    
+    if not task:
+        await message.reply_text(
+            f"❌ User {target_user_id} does not have any task in 'pending_otp' status.\n\n"
+            f"Make sure the user has completed a task and is waiting for OTP verification.",
+            reply_markup=get_admin_menu_by_permissions(user.id)
+        )
+        del context.user_data['awaiting_gen_otp_user']
+        return
+    
+    task_dict = dict(task)
+    task_id = task_dict['task_id']
+    task_name = task_dict['name']
+    email = f"{task_dict['address']}@gmail.com"
+    
+    # Generate OTP
+    otp = generate_otp()
+    
+    # Store admin OTP
+    store_admin_otp(target_user_id, task_id, otp)
+    
+    # Send OTP to user via bot message
+    try:
+        await context.bot.send_message(
+            chat_id=target_user_id,
+            text=f"🔐 <b>Admin Generated Verification Code</b>\n\n"
+                 f"Task: <code>{task_name}</code>\n"
+                 f"Your verification code is: <code>{otp}</code>\n\n"
+                 f"⚠️ This code expires in <b>5 minutes</b> and can only be used once.\n"
+                 f"💡 Enter this code in the bot to complete your task submission.\n\n"
+                 f"<i>If you didn't request this, please contact admin immediately.</i>",
+            parse_mode=ParseMode.HTML
+        )
+        await message.reply_text(
+            f"✅ OTP code generated and sent to user {target_user_id}!\n\n"
+            f"📧 Email: {email}\n"
+            f"🔑 OTP Code: <code>{otp}</code>\n"
+            f"⏰ Expires in 5 minutes\n"
+            f"📋 Task: {task_name}\n\n"
+            f"💡 The user can now enter this code to verify the task.",
+            parse_mode=ParseMode.HTML,
+            reply_markup=get_admin_menu_by_permissions(user.id)
+        )
+    except Exception as e:
+        await message.reply_text(
+            f"❌ Failed to send OTP to user: {str(e)}\n\n"
+            f"📧 Email: {email}\n"
+            f"🔑 OTP Code: <code>{otp}</code>\n"
+            f"⚠️ Please send this code to the user manually.",
+            parse_mode=ParseMode.HTML,
+            reply_markup=get_admin_menu_by_permissions(user.id)
+        )
+    
+    del context.user_data['awaiting_gen_otp_user']
 
 # ==================== EMAIL ACCOUNT MANAGEMENT ====================
 def get_email_accounts() -> List[Dict]:
@@ -924,7 +1333,6 @@ def create_user(user_id: int, username: str, first_name: str, last_name: str = "
         update_user_activity(user_id)
         return False, "User already exists"
     
-    # Use user_id as referral code
     if referral_code:
         try:
             referrer_id = int(referral_code)
@@ -937,7 +1345,6 @@ def create_user(user_id: int, username: str, first_name: str, last_name: str = "
         except ValueError:
             referral_code = None
     
-    # Generate referral_id for backward compatibility
     referral_id = hashlib.md5(f"{user_id}{time.time()}".encode()).hexdigest()[:8]
     
     referred_by = None
@@ -1155,10 +1562,16 @@ def get_admin_menu_by_permissions(user_id: int):
         available_buttons.append("📊 Dashboard")
     if 'add' in permissions:
         available_buttons.append("📦 Bulk Add Tasks")
+    if 'available' in permissions:
+        available_buttons.append("📋 Available Tasks")
+    if 'pending_otp' in permissions:
+        available_buttons.append("⏳ Pending OTP Tasks")
     if 'pending' in permissions:
         available_buttons.append("⏳ Pending Tasks")
     if 'completed' in permissions:
         available_buttons.append("✅ Completed Tasks")
+    if 'expired' in permissions:
+        available_buttons.append("💀 Expired Tasks")
     if 'payout' in permissions:
         available_buttons.append("💰 Pending Payouts")
     if 'manage' in permissions:
@@ -1183,6 +1596,14 @@ def get_admin_menu_by_permissions(user_id: int):
         available_buttons.append("🎯 Referral Settings")
     if 'export' in permissions:
         available_buttons.append("📥 Export Tasks")
+    if 'delete' in permissions:
+        available_buttons.append("🗑️ Delete Tasks")
+    if 'otp_toggle' in permissions:
+        available_buttons.append("🔐 Toggle OTP")
+    if 'expire_settings' in permissions:
+        available_buttons.append("⏰ Expire Time")
+    if 'gen_otp' in permissions:
+        available_buttons.append("🔑 Generate OTP")
     
     buttons = []
     for i in range(0, len(available_buttons), 2):
@@ -1310,12 +1731,6 @@ async def show_channel_requirement(update: Update, context: ContextTypes.DEFAULT
     )
 
 # ==================== TASK MANAGEMENT ====================
-def get_task_expiry_hours():
-    try:
-        return int(get_system_setting('task_expiry_hours', '24'))
-    except:
-        return 24
-
 def get_available_task(user_id: int):
     expire_old_tasks()
     
@@ -1332,7 +1747,7 @@ def get_available_task(user_id: int):
     
     if row:
         task = dict(row)
-        expiry_hours = get_task_expiry_hours()
+        expiry_hours = get_assigned_task_expiry_hours()
         expiry_time = datetime.now() + timedelta(hours=expiry_hours)
         
         conn = Database.get_connection()
@@ -1383,6 +1798,84 @@ def expire_old_tasks():
             ''', (user_id,))
     
     conn.commit()
+    
+    if len(expired_tasks) > 0:
+        print(f"⏰ Expired {len(expired_tasks)} assigned tasks")
+    
+    return len(expired_tasks)
+
+def expire_old_available_tasks():
+    conn = Database.get_connection()
+    cursor = conn.cursor()
+    
+    expiry_hours = get_available_task_expiry_hours()
+    
+    cursor.execute('''
+    UPDATE tasks 
+    SET status = 'rejected' 
+    WHERE status = 'available' 
+    AND created_date < datetime('now', ?)
+    ''', (f'-{expiry_hours} hours',))
+    
+    expired_count = cursor.rowcount
+    conn.commit()
+    
+    if expired_count > 0:
+        print(f"⏰ Expired {expired_count} available tasks (older than {expiry_hours} hours)")
+    
+    return expired_count
+
+def expire_old_pending_otp_tasks():
+    conn = Database.get_connection()
+    cursor = conn.cursor()
+    
+    expiry_hours = get_pending_otp_expiry_hours()
+    
+    cursor.execute('''
+    SELECT task_id, assigned_to FROM tasks 
+    WHERE status = 'pending_otp' 
+    AND completed_time < datetime('now', ?)
+    ''', (f'-{expiry_hours} hours',))
+    
+    expired_tasks = cursor.fetchall()
+    
+    for task in expired_tasks:
+        task_id = task['task_id']
+        user_id = task['assigned_to']
+        
+        cursor.execute('UPDATE tasks SET status = "expired" WHERE task_id = ?', (task_id,))
+        
+        if user_id:
+            cursor.execute('''
+            UPDATE users 
+            SET active_tasks_count = active_tasks_count - 1 
+            WHERE user_id = ? AND active_tasks_count > 0
+            ''', (user_id,))
+    
+    conn.commit()
+    
+    if len(expired_tasks) > 0:
+        print(f"⏰ Expired {len(expired_tasks)} pending OTP tasks")
+    
+    return len(expired_tasks)
+
+def delete_marked_tasks():
+    conn = Database.get_connection()
+    cursor = conn.cursor()
+    
+    cursor.execute('''
+    DELETE FROM tasks 
+    WHERE marked_for_deletion = 1 
+    AND download_time < datetime('now', ?)
+    ''', (f'-{DOWNLOAD_DELETE_HOURS} hours',))
+    
+    deleted_count = cursor.rowcount
+    conn.commit()
+    
+    if deleted_count > 0:
+        print(f"🗑️ Deleted {deleted_count} tasks (downloaded {DOWNLOAD_DELETE_HOURS}+ hours ago)")
+    
+    return deleted_count
 
 def delete_expired_tasks():
     conn = Database.get_connection()
@@ -1398,22 +1891,9 @@ def delete_expired_tasks():
     conn.commit()
     
     if deleted_count > 0:
-        print(f"Deleted {deleted_count} expired tasks older than 24 hours")
+        print(f"🗑️ Deleted {deleted_count} expired tasks older than 24 hours")
     
     return deleted_count
-
-def delete_completed_task(task_id: int, admin_id: int) -> Tuple[bool, str]:
-    conn = Database.get_connection()
-    cursor = conn.cursor()
-    
-    task = Database.fetchone('SELECT * FROM tasks WHERE task_id = ? AND status = "approved"', (task_id,))
-    if not task:
-        return False, "Task not found or not approved"
-    
-    cursor.execute('DELETE FROM tasks WHERE task_id = ?', (task_id,))
-    conn.commit()
-    
-    return True, f"✅ Task #{task_id} deleted successfully!"
 
 def mark_task_for_otp(task_id: int, user_id: int):
     conn = Database.get_connection()
@@ -1439,6 +1919,48 @@ def mark_task_for_otp(task_id: int, user_id: int):
     
     conn.commit()
     return True, email
+
+def submit_task_direct(task_id: int, user_id: int):
+    conn = Database.get_connection()
+    cursor = conn.cursor()
+    
+    cursor.execute('''
+    SELECT * FROM tasks 
+    WHERE task_id = ? AND assigned_to = ? AND status = 'assigned'
+    ''', (task_id, user_id))
+    
+    task = cursor.fetchone()
+    if not task:
+        return False
+    
+    task_dict = dict(task)
+    reward = task_dict['reward']
+    
+    cursor.execute('''
+    UPDATE tasks 
+    SET status = 'pending', completed_time = CURRENT_TIMESTAMP
+    WHERE task_id = ?
+    ''', (task_id,))
+    
+    cursor.execute('''
+    UPDATE users 
+    SET active_tasks_count = active_tasks_count - 1 
+    WHERE user_id = ? AND active_tasks_count > 0
+    ''', (user_id,))
+    
+    cursor.execute('''
+    UPDATE users 
+    SET hold_balance = hold_balance + ? 
+    WHERE user_id = ?
+    ''', (reward, user_id))
+    
+    cursor.execute('''
+    INSERT INTO transactions (user_id, amount, trans_type, task_id, details)
+    VALUES (?, ?, ?, ?, ?)
+    ''', (user_id, reward, 'task_pending', task_id, f'Task pending approval (direct submit)'))
+    
+    conn.commit()
+    return True
 
 def submit_task_after_otp(task_id: int, user_id: int):
     conn = Database.get_connection()
@@ -1477,7 +1999,7 @@ def submit_task_after_otp(task_id: int, user_id: int):
     cursor.execute('''
     INSERT INTO transactions (user_id, amount, trans_type, task_id, details)
     VALUES (?, ?, ?, ?, ?)
-    ''', (user_id, reward, 'task_pending', task_id, f'Task #{task_id} pending approval'))
+    ''', (user_id, reward, 'task_pending', task_id, f'Task pending approval (OTP verified)'))
     
     conn.commit()
     return True
@@ -1591,8 +2113,8 @@ def create_task(name: str, father_name: str, address: str, password: str):
     
     try:
         cursor = Database.execute('''
-        INSERT INTO tasks (unique_task_id, name, father_name, address, password, reward, status)
-        VALUES (?, ?, ?, ?, ?, ?, 'available')
+        INSERT INTO tasks (unique_task_id, name, father_name, address, password, reward, status, created_date)
+        VALUES (?, ?, ?, ?, ?, ?, 'available', CURRENT_TIMESTAMP)
         ''', (unique_id, name.strip(), father_name.strip() if father_name else '', address, password.strip(), reward))
         
         return cursor.lastrowid, unique_id, f"✅ Task created successfully with ID: {unique_id}"
@@ -1639,8 +2161,8 @@ def create_bulk_tasks(tasks_data: List[Dict]) -> Tuple[int, List[str]]:
             unique_id = generate_task_id()
             
             Database.execute('''
-            INSERT INTO tasks (unique_task_id, name, father_name, address, password, reward, status)
-            VALUES (?, ?, ?, ?, ?, ?, 'available')
+            INSERT INTO tasks (unique_task_id, name, father_name, address, password, reward, status, created_date)
+            VALUES (?, ?, ?, ?, ?, ?, 'available', CURRENT_TIMESTAMP)
             ''', (unique_id, name, father_name, address, password, reward))
             
             created += 1
@@ -1699,7 +2221,7 @@ def approve_task(task_id: int, admin_id: int, custom_message: str = None, image_
     cursor.execute('''
     INSERT INTO transactions (user_id, amount, trans_type, task_id, details)
     VALUES (?, ?, ?, ?, ?)
-    ''', (user_id, reward, 'task_completion', task_id, f'Task #{task_id} approved'))
+    ''', (user_id, reward, 'task_completion', task_id, f'Task approved'))
     
     user = get_user(user_id)
     if user and user.get('referred_by'):
@@ -1917,7 +2439,7 @@ def process_payout(payout_id: int, approve: bool, admin_id: int, image_path: str
         cursor.execute('''
         INSERT INTO transactions (user_id, amount, trans_type, details)
         VALUES (?, ?, ?, ?)
-        ''', (user_id, -amount, 'withdrawal_approved', f'Payout #{payout_id} approved'))
+        ''', (user_id, -amount, 'withdrawal_approved', f'Payout approved'))
         
     else:
         cursor.execute('''
@@ -1935,7 +2457,7 @@ def process_payout(payout_id: int, approve: bool, admin_id: int, image_path: str
         cursor.execute('''
         INSERT INTO transactions (user_id, amount, trans_type, details)
         VALUES (?, ?, ?, ?)
-        ''', (user_id, amount, 'withdrawal_rejected', f'Payout #{payout_id} rejected - funds returned'))
+        ''', (user_id, amount, 'withdrawal_rejected', f'Payout rejected - funds returned'))
     
     conn.commit()
     return True
@@ -2104,6 +2626,70 @@ async def send_user_notification(context, user_id: int, message: str, image_path
         print(f"Error sending notification to {user_id}: {e}")
         return False
 
+# ==================== WARNING SYSTEM FOR ADMIN ====================
+async def check_and_warn_admin(context: ContextTypes.DEFAULT_TYPE):
+    admin_id = OWNER_ID
+    warning_hours = get_warning_hours_before()
+    
+    available_expiry_hours = get_available_task_expiry_hours()
+    warning_time = available_expiry_hours - warning_hours
+    
+    available_count = Database.fetchone('''
+    SELECT COUNT(*) FROM tasks 
+    WHERE status = 'available' 
+    AND created_date < datetime('now', ?) 
+    AND created_date > datetime('now', ?)
+    ''', (f'-{available_expiry_hours} hours', f'-{warning_time} hours'))[0] if warning_time > 0 else 0
+    
+    pending_otp_expiry_hours = get_pending_otp_expiry_hours()
+    warning_time_otp = pending_otp_expiry_hours - warning_hours
+    
+    pending_otp_count = Database.fetchone('''
+    SELECT COUNT(*) FROM tasks 
+    WHERE status = 'pending_otp' 
+    AND completed_time < datetime('now', ?) 
+    AND completed_time > datetime('now', ?)
+    ''', (f'-{pending_otp_expiry_hours} hours', f'-{warning_time_otp} hours'))[0] if warning_time_otp > 0 else 0
+    
+    assigned_expiry_hours = get_assigned_task_expiry_hours()
+    warning_time_assigned = assigned_expiry_hours - warning_hours
+    
+    assigned_count = Database.fetchone('''
+    SELECT COUNT(*) FROM tasks 
+    WHERE status = 'assigned' 
+    AND expiry_time < datetime('now', ?) 
+    AND expiry_time > datetime('now', ?)
+    ''', (f'+{warning_hours} hours', 'now'))[0] if warning_time_assigned > 0 else 0
+    
+    if available_count > 0 or pending_otp_count > 0 or assigned_count > 0:
+        message = "<b>⚠️ TASK EXPIRY WARNING</b>\n\n"
+        message += "The following tasks are about to expire:\n\n"
+        
+        if available_count > 0:
+            message += f"📋 Available Tasks: {available_count} tasks will expire in {warning_hours} hours\n"
+            message += f"   → Use: <code>📥 Export Available</code> to download them\n"
+        
+        if pending_otp_count > 0:
+            message += f"⏳ Pending OTP Tasks: {pending_otp_count} tasks will expire in {warning_hours} hours\n"
+            message += f"   → Use: <code>📥 Export Pending OTP</code> to download them\n"
+            message += f"   → Or use: <code>🔑 Generate OTP</code> to help users who are stuck\n"
+        
+        if assigned_count > 0:
+            message += f"📋 Assigned Tasks: {assigned_count} tasks will expire in {warning_hours} hours\n"
+            message += f"   → These will auto-expire and become available for others\n"
+        
+        message += f"\n<i>💡 Download tasks before they expire to save them!</i>"
+        message += f"\n<i>🗑️ Downloaded tasks will be automatically deleted in {DOWNLOAD_DELETE_HOURS} hours.</i>"
+        
+        try:
+            await context.bot.send_message(
+                chat_id=admin_id,
+                text=message,
+                parse_mode=ParseMode.HTML
+            )
+        except Exception as e:
+            print(f"Error sending warning to admin: {e}")
+
 # ==================== KEYBOARD DEFINITIONS ====================
 def get_main_menu(user_id: int):
     admin_status = is_admin(user_id)
@@ -2195,8 +2781,8 @@ def get_admin_user_management_menu():
 
 def get_admin_user_detail_menu(user_id: int):
     buttons = [
-        [f"💰 Add Balance #{user_id}", f"📉 Subtract Balance #{user_id}"],
-        [f"📨 Message User #{user_id}", f"📊 View Details #{user_id}"],
+        [f"💰 Add Balance {user_id}", f"📉 Subtract Balance {user_id}"],
+        [f"📨 Message User {user_id}", f"📊 View Details {user_id}"],
         ["🔙 Back to Users", "🏠 Admin Menu"]
     ]
     return ReplyKeyboardMarkup(buttons, resize_keyboard=True)
@@ -2208,9 +2794,9 @@ def get_admin_broadcast_menu():
     ]
     return ReplyKeyboardMarkup(buttons, resize_keyboard=True)
 
-def get_admin_task_review_menu(task_id: int):
+def get_admin_task_review_menu():
     buttons = [
-        [f"✅ Approve #{task_id}", f"❌ Reject #{task_id}"],
+        ["✅ Approve", "❌ Reject"],
         ["⏭️ Next Task", "🏠 Admin Menu"]
     ]
     return ReplyKeyboardMarkup(buttons, resize_keyboard=True)
@@ -2231,9 +2817,6 @@ def get_payout_rejection_options():
     return ReplyKeyboardMarkup(buttons, resize_keyboard=True)
 
 def get_admin_channels_menu():
-    channels = get_mandatory_channels()
-    channels_list = "\n".join([f"• {ch}" for ch in channels]) if channels else "No channels added"
-    
     buttons = [
         ["➕ Add Channel", "➖ Remove Channel"],
         ["📋 View All Channels", "🔙 Back to Admin Menu"]
@@ -2273,46 +2856,54 @@ def get_admin_referral_menu():
     return ReplyKeyboardMarkup(buttons, resize_keyboard=True)
 
 def get_admin_delete_tasks_menu():
-    """Updated menu with separate buttons for Failed and Expired tasks"""
     buttons = [
-        ["🗑️ Delete Single Completed Task"],
-        ["🗑️ Delete All Completed Tasks"],
-        ["🗑️ Delete All Failed Tasks"],
-        ["🗑️ Delete All Expired Tasks"],
+        ["🗑️ Delete Single Completed"],
+        ["🗑️ Delete All Completed"],
+        ["🗑️ Delete All Failed"],
+        ["🗑️ Delete Single Available"],
+        ["🗑️ Delete All Available"],
+        ["🗑️ Delete Single Pending OTP"],
+        ["🗑️ Delete All Pending OTP"],
+        ["🗑️ Delete All Expired"],
         ["🔙 Back to Admin Settings"]
     ]
     return ReplyKeyboardMarkup(buttons, resize_keyboard=True)
 
 def get_admin_export_menu():
-    """Updated menu with Expired Tasks export option"""
     buttons = [
-        ["📥 Export Completed Tasks"],
-        ["📥 Export Failed Tasks"],
-        ["📥 Export Expired Tasks"],
+        ["📥 Export Available"],
+        ["📥 Export Pending OTP"],
+        ["📥 Export Completed"],
+        ["📥 Export Expired"],
+        ["📥 Export Failed"],
+        ["📥 Export Pending Review"],
         ["🔙 Back to Admin Menu"]
     ]
     return ReplyKeyboardMarkup(buttons, resize_keyboard=True)
 
 def get_admin_settings_menu():
     buttons = [
-        ["💰 Adjust Rewards", "⏰ Set Expiry Hours"],
+        ["💰 Adjust Rewards", "⏰ Expire Time"],
         ["📋 Payment Methods", "📝 Update Messages"],
         ["📢 Manage Channels", "🔍 Task Info"],
         ["📧 Email Accounts", "🗑️ Delete Tasks"],
         ["🎯 Milestone Bonuses", "📞 Set Contact Admin"],
         ["🎯 Referral Settings", "➕ Add Admin"],
         ["➖ Remove Admin", "📋 Admin List"],
+        ["🔐 Toggle OTP", "🔑 Generate OTP"],
         ["🏠 Admin Menu"]
     ]
     return ReplyKeyboardMarkup(buttons, resize_keyboard=True)
 
-def get_delete_tasks_menu():
-    """Updated menu with separate buttons for Failed and Expired tasks"""
+def get_expire_time_menu():
+    available_expiry = get_available_task_expiry_hours()
+    pending_otp_expiry = get_pending_otp_expiry_hours()
+    assigned_expiry = get_assigned_task_expiry_hours()
+    warning_hours = get_warning_hours_before()
+    
     buttons = [
-        ["🗑️ Delete Single Completed Task"],
-        ["🗑️ Delete All Completed Tasks"],
-        ["🗑️ Delete All Failed Tasks"],
-        ["🗑️ Delete All Expired Tasks"],
+        [f"📋 Available Tasks: {available_expiry}h", f"⏳ Pending OTP: {pending_otp_expiry}h"],
+        [f"✅ Assigned Tasks: {assigned_expiry}h", f"🔔 Warning Before: {warning_hours}h"],
         ["🔙 Back to Admin Settings"]
     ]
     return ReplyKeyboardMarkup(buttons, resize_keyboard=True)
@@ -2364,7 +2955,7 @@ async def take_new_task(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
         
     context.user_data['current_task'] = task['task_id']
-    expiry_hours = get_task_expiry_hours()
+    expiry_hours = get_assigned_task_expiry_hours()
     settings = get_bonus_settings()
     
     task_msg = (
@@ -2519,51 +3110,115 @@ async def handle_task_done(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
     
-    success, email = mark_task_for_otp(task_id, user.id)
+    if is_otp_enabled():
+        success, email = mark_task_for_otp(task_id, user.id)
+        
+        if not success:
+            await message.reply_text(
+                "❌ Failed to process task. Please try again.",
+                reply_markup=get_main_menu(user.id)
+            )
+            return
+        
+        otp = generate_otp()
+        
+        sent_msg = await message.reply_text(
+            f"✉️ Sending verification code to <code>{email}</code>...\n\n"
+            f"Please check your inbox (or spam folder).\n"
+            f"Enter the 6-digit code to verify task completion.\n\n"
+            f"💡 You can resend the code up to 3 times if needed.\n"
+            f"💡 If you didn't receive the code, contact admin for help.",
+            parse_mode=ParseMode.HTML
+        )
+        await queue_message_for_deletion(user.id, sent_msg.message_id)
+        
+        task = Database.fetchone('SELECT name FROM tasks WHERE task_id = ?', (task_id,))
+        task_name = task['name'] if task else ""
+        
+        if send_otp_email(email, otp, task_name):
+            store_task_otp(user.id, task_id, email, otp)
+            context.user_data['awaiting_task_otp'] = True
+            context.user_data['otp_task_id'] = task_id
+            
+            sent_msg = await message.reply_text(
+                "🔐 <b>Verification Code Sent!</b>\n\n"
+                "Please enter the 6-digit code you received.\n"
+                f"You have 3 attempts, code expires in 5 minutes.\n\n"
+                f"📨 You can resend the code {otp_storage[user.id]['max_resend']} times.\n\n"
+                f"❌ If you didn't receive the code, contact admin for help.",
+                parse_mode=ParseMode.HTML,
+                reply_markup=get_otp_action_menu(otp_storage[user.id]['max_resend'])
+            )
+            await queue_message_for_deletion(user.id, sent_msg.message_id)
+        else:
+            Database.execute('''
+            UPDATE tasks SET status = 'assigned' WHERE task_id = ?
+            ''', (task_id,))
+            await message.reply_text(
+                "❌ Failed to send verification email.\n\n"
+                "Please contact admin for assistance.",
+                reply_markup=get_task_action_menu()
+            )
+    else:
+        context.user_data['awaiting_task_confirmation'] = True
+        context.user_data['confirm_task_id'] = task_id
+        
+        sent_msg = await message.reply_text(
+            "⚠️ <b>Confirm Task Submission</b>\n\n"
+            "Are you sure you completed this task?\n\n"
+            "⚠️ Make sure you used the exact details provided!\n"
+            "⚠️ False submissions may lead to account suspension!\n\n"
+            "Click 'Confirm Done' to submit for admin review.",
+            parse_mode=ParseMode.HTML,
+            reply_markup=get_task_confirmation_menu()
+        )
+        await queue_message_for_deletion(user.id, sent_msg.message_id)
+
+async def handle_confirm_task_done_direct(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    message = update.message
     
-    if not success:
+    task_id = context.user_data.get('confirm_task_id') or context.user_data.get('current_task')
+    
+    if not task_id:
         await message.reply_text(
-            "❌ Failed to process task. Please try again.",
+            "No active task found.",
             reply_markup=get_main_menu(user.id)
         )
         return
     
-    otp = generate_otp()
-    
-    sent_msg = await message.reply_text(
-        f"✉️ Sending verification code to <code>{email}</code>...\n\n"
-        f"Please check your inbox (or spam folder).\n"
-        f"Enter the 6-digit code to verify task completion.\n\n"
-        f"💡 You can resend the code up to 3 times if needed.",
-        parse_mode=ParseMode.HTML
-    )
-    await queue_message_for_deletion(user.id, sent_msg.message_id)
-    
-    task = Database.fetchone('SELECT name FROM tasks WHERE task_id = ?', (task_id,))
-    task_name = task['name'] if task else ""
-    
-    if send_otp_email(email, otp, task_name):
-        store_task_otp(user.id, task_id, email, otp)
-        context.user_data['awaiting_task_otp'] = True
-        context.user_data['otp_task_id'] = task_id
+    if submit_task_direct(task_id, user.id):
+        if 'task_message_id' in context.user_data:
+            try:
+                await context.bot.delete_message(
+                    chat_id=user.id,
+                    message_id=context.user_data['task_message_id']
+                )
+            except:
+                pass
+            del context.user_data['task_message_id']
+        
+        settings = get_bonus_settings()
+        reward = settings['task_reward']
         
         sent_msg = await message.reply_text(
-            "🔐 <b>Verification Code Sent!</b>\n\n"
-            "Please enter the 6-digit code you received.\n"
-            f"You have 3 attempts, code expires in 5 minutes.\n\n"
-            f"📨 You can resend the code {otp_storage[user.id]['max_resend']} times.",
-            parse_mode=ParseMode.HTML,
-            reply_markup=get_otp_action_menu(otp_storage[user.id]['max_resend'])
+            f"✅ Task submitted for admin approval!\n\n"
+            f"The task has been submitted for admin review.\n"
+            f"⏰ You'll be notified when it's approved.\n"
+            f"💰 Reward: ETB{reward:.2f} (pending)\n\n"
+            f"✅ You can now take another task!",
+            reply_markup=get_main_menu(user.id)
         )
         await queue_message_for_deletion(user.id, sent_msg.message_id)
+        
+        context.user_data.pop('current_task', None)
+        context.user_data.pop('active_task_id', None)
+        context.user_data.pop('awaiting_task_confirmation', None)
+        context.user_data.pop('confirm_task_id', None)
     else:
-        Database.execute('''
-        UPDATE tasks SET status = 'assigned' WHERE task_id = ?
-        ''', (task_id,))
         await message.reply_text(
-            "❌ Failed to send verification email.\n\n"
-            "Please try again or contact support.",
-            reply_markup=get_task_action_menu()
+            "❌ Failed to submit task. Please contact support.",
+            reply_markup=get_main_menu(user.id)
         )
 
 async def handle_otp_resend(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -2624,33 +3279,11 @@ async def handle_otp_cancel_task(update: Update, context: ContextTypes.DEFAULT_T
         await queue_message_for_deletion(user.id, sent_msg.message_id)
 
 async def handle_task_otp_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Fixed OTP input handler that properly checks for cancel/resend buttons"""
     user = update.effective_user
     message = update.message
-    text = message.text.strip()
+    otp = message.text.strip()
     
-    # FIRST: Check for Cancel Task button during OTP phase
-    if text == "❌ Cancel Task":
-        await handle_otp_cancel_task(update, context)
-        return
-    
-    # SECOND: Check for Resend Code button
-    if text.startswith("📨 Resend Code"):
-        await handle_otp_resend(update, context)
-        return
-    
-    # THIRD: Check for Main Menu
-    if text == "🏠 Main Menu":
-        context.user_data.pop('awaiting_task_otp', None)
-        context.user_data.pop('otp_task_id', None)
-        await message.reply_text(
-            "Returning to main menu...",
-            reply_markup=get_main_menu(user.id)
-        )
-        return
-    
-    # FOURTH: Validate OTP format
-    if not text.isdigit() or len(text) != 6:
+    if not otp.isdigit() or len(otp) != 6:
         sent_msg = await message.reply_text(
             "❌ Invalid code!\n\n"
             "Please enter the 6-digit verification code:",
@@ -2659,8 +3292,7 @@ async def handle_task_otp_input(update: Update, context: ContextTypes.DEFAULT_TY
         await queue_message_for_deletion(user.id, sent_msg.message_id)
         return
     
-    # FIFTH: Verify the OTP
-    success, task_id, result = verify_task_otp(user.id, text)
+    success, task_id, result = verify_task_otp(user.id, otp)
     
     if success and task_id:
         if submit_task_after_otp(task_id, user.id):
@@ -2704,7 +3336,8 @@ async def handle_task_otp_input(update: Update, context: ContextTypes.DEFAULT_TY
         context.user_data.pop('otp_task_id', None)
         
         sent_msg = await message.reply_text(
-            f"❌ {result}\n\nTask has been cancelled.",
+            f"❌ {result}\n\nTask has been cancelled.\n\n"
+            f"💡 Contact admin for assistance if needed.",
             reply_markup=get_main_menu(user.id)
         )
         await queue_message_for_deletion(user.id, sent_msg.message_id)
@@ -2719,38 +3352,38 @@ async def handle_cancel_during_otp(update: Update, context: ContextTypes.DEFAULT
     user = update.effective_user
     message = update.message
     
-    if user.id in otp_storage:
-        data = otp_storage[user.id]
-        task_id = data["task_id"]
-        
-        if cancel_otp_task_in_db(task_id, user.id):
+    if user.id in otp_storage or user.id in admin_otp_storage:
+        if user.id in otp_storage:
+            data = otp_storage[user.id]
+            task_id = data["task_id"]
+            cancel_otp_task_in_db(task_id, user.id)
             del otp_storage[user.id]
-            context.user_data.pop('current_task', None)
-            context.user_data.pop('active_task_id', None)
-            context.user_data.pop('awaiting_task_otp', None)
-            context.user_data.pop('otp_task_id', None)
-            
-            if 'task_message_id' in context.user_data:
-                try:
-                    await context.bot.delete_message(
-                        chat_id=user.id,
-                        message_id=context.user_data['task_message_id']
-                    )
-                except:
-                    pass
-                del context.user_data['task_message_id']
-            
-            sent_msg = await message.reply_text(
-                "❌ Task cancelled.\n\nYou can now take another task.",
-                reply_markup=get_main_menu(user.id)
-            )
-            await queue_message_for_deletion(user.id, sent_msg.message_id)
-        else:
-            sent_msg = await message.reply_text(
-                "❌ Failed to cancel task.",
-                reply_markup=get_main_menu(user.id)
-            )
-            await queue_message_for_deletion(user.id, sent_msg.message_id)
+        elif user.id in admin_otp_storage:
+            data = admin_otp_storage[user.id]
+            task_id = data["task_id"]
+            cancel_otp_task_in_db(task_id, user.id)
+            del admin_otp_storage[user.id]
+        
+        context.user_data.pop('current_task', None)
+        context.user_data.pop('active_task_id', None)
+        context.user_data.pop('awaiting_task_otp', None)
+        context.user_data.pop('otp_task_id', None)
+        
+        if 'task_message_id' in context.user_data:
+            try:
+                await context.bot.delete_message(
+                    chat_id=user.id,
+                    message_id=context.user_data['task_message_id']
+                )
+            except:
+                pass
+            del context.user_data['task_message_id']
+        
+        sent_msg = await message.reply_text(
+            "❌ Task cancelled.\n\nYou can now take another task.",
+            reply_markup=get_main_menu(user.id)
+        )
+        await queue_message_for_deletion(user.id, sent_msg.message_id)
     else:
         await handle_task_cancel(update, context)
 
@@ -2889,6 +3522,10 @@ async def handle_confirm_task_done(update: Update, context: ContextTypes.DEFAULT
     user = update.effective_user
     message = update.message
     
+    if context.user_data.get('awaiting_task_confirmation'):
+        await handle_confirm_task_done_direct(update, context)
+        return
+    
     task_id = context.user_data.get('current_task')
     
     if not task_id:
@@ -2979,7 +3616,8 @@ async def handle_my_tasks(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 return
             elif task['status'] == 'pending_otp':
                 response += "\n⚠️ You have a task waiting for OTP verification.\n"
-                response += "Please enter the code sent to your email to complete the task."
+                response += "Please enter the code sent to your email to complete the task.\n"
+                response += "💡 If you didn't receive the code, contact admin for help."
                 sent_msg = await message.reply_text(
                     response,
                     parse_mode=ParseMode.HTML,
@@ -3059,7 +3697,6 @@ async def handle_my_referrals(update: Update, context: ContextTypes.DEFAULT_TYPE
         )
         return
     
-    # Use user_id as referral code
     referral_code = str(user.id)
     referral_count = user_data['referral_count']
     
@@ -3075,7 +3712,6 @@ async def handle_my_referrals(update: Update, context: ContextTypes.DEFAULT_TYPE
         f"✅ Total Referrals: {referral_count}\n"
     )
     
-    # Only show milestone bonuses if enabled
     milestone_settings = get_milestone_settings()
     if milestone_settings['is_enabled']:
         milestones = get_milestones()
@@ -3392,8 +4028,15 @@ async def handle_admin_dashboard(update: Update, context: ContextTypes.DEFAULT_T
     pending_payouts = Database.fetchone('SELECT COUNT(*) as count FROM payouts WHERE status = "pending"')[0]
     total_payouts = Database.fetchone('SELECT SUM(amount) as total FROM payouts WHERE status = "approved"')[0] or 0
     
-    expiry_hours = get_task_expiry_hours()
+    available_expiry = get_available_task_expiry_hours()
+    pending_otp_expiry = get_pending_otp_expiry_hours()
+    assigned_expiry = get_assigned_task_expiry_hours()
+    warning_hours = get_warning_hours_before()
+    
     email_accounts = Database.fetchone('SELECT COUNT(*) FROM email_accounts WHERE is_active = 1')[0] or 0
+    otp_status = "✅ ENABLED" if is_otp_enabled() else "❌ DISABLED"
+    
+    approved_tasks_count = stats.get('approved_tasks', 0)
     
     response = (
         f"👑 Admin Dashboard\n\n"
@@ -3405,21 +4048,26 @@ async def handle_admin_dashboard(update: Update, context: ContextTypes.DEFAULT_T
         f"⏳ Assigned: {stats.get('assigned_tasks', 0)}\n"
         f"⏳ Waiting OTP: {stats.get('pending_otp_tasks', 0)}\n"
         f"⏳ Pending Review: {stats.get('pending_tasks', 0)}\n"
-        f"✅ Approved: {stats.get('approved_tasks', 0)}\n"
+        f"✅ Approved: {approved_tasks_count}\n"
         f"❌ Rejected: {stats.get('rejected_tasks', 0)}\n"
-        f"💀 Expired: {stats.get('expired_tasks', 0)}\n"
-        f"📊 Total: {stats.get('total_tasks', 0)}\n\n"
+        f"💀 Expired: {stats.get('expired_tasks', 0)}\n\n"
         f"💰 Financial Statistics:\n"
         f"💸 Pending Payouts: {pending_payouts}\n"
         f"✅ Total Paid: ETB{total_payouts:.2f}\n\n"
         f"📧 Email Accounts Active: {email_accounts}\n"
-        f"🎯 Milestone Bonuses: {'✅ Enabled' if milestone_settings['is_enabled'] else '❌ Disabled'}\n\n"
-        f"⚙️ Current Settings:\n"
+        f"🎯 Milestone Bonuses: {'✅ Enabled' if milestone_settings['is_enabled'] else '❌ Disabled'}\n"
+        f"🔐 OTP Verification: {otp_status}\n\n"
+        f"⚙️ Expiry Settings:\n"
+        f"📋 Available Tasks: {available_expiry} hours\n"
+        f"⏳ Pending OTP: {pending_otp_expiry} hours\n"
+        f"✅ Assigned Tasks: {assigned_expiry} hours\n"
+        f"🔔 Warning Before: {warning_hours} hours\n"
+        f"🗑️ Auto-Delete After Download: {DOWNLOAD_DELETE_HOURS} hours\n\n"
+        f"⚙️ Reward Settings:\n"
         f"💰 Min Withdrawal: ETB{settings['min_withdrawal']:.2f}\n"
         f"👥 Referral Bonus: ETB{settings['referral_bonus']:.2f}\n"
         f"📊 Referral Percentage: {settings['referral_percentage']}%\n"
-        f"✅ Task Reward: ETB{settings['task_reward']:.2f}\n"
-        f"⏰ Task Expiry: {expiry_hours} hours\n\n"
+        f"✅ Task Reward: ETB{settings['task_reward']:.2f}\n\n"
         f"🕒 Last Updated: {datetime.now().strftime('%Y-%m-%d %H:%M')}"
     )
     
@@ -3429,6 +4077,291 @@ async def handle_admin_dashboard(update: Update, context: ContextTypes.DEFAULT_T
     )
     await queue_message_for_deletion(user.id, sent_msg.message_id)
 
+# ==================== EXPIRE TIME SETTINGS HANDLER ====================
+async def handle_expire_time_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    
+    if not is_admin(user.id) or 'expire_settings' not in get_admin_permissions(user.id):
+        await update.message.reply_text(
+            "❌ You don't have permission to change expiry settings!",
+            reply_markup=get_admin_menu_by_permissions(user.id)
+        )
+        return
+    
+    await update.message.reply_text(
+        "⏰ <b>EXPIRE TIME SETTINGS</b>\n\n"
+        "Configure how long tasks stay in each status before expiring.\n\n"
+        "• <b>Available Tasks</b>: How long a task waits before expiring\n"
+        "• <b>Pending OTP</b>: How long a task waits for OTP verification\n"
+        "• <b>Assigned Tasks</b>: How long a user has to complete a task\n"
+        "• <b>Warning Before</b>: How early to warn admin before expiry\n\n"
+        "<i>Tasks will be automatically deleted 24 hours after download.</i>\n\n"
+        "Select which setting to change:",
+        parse_mode=ParseMode.HTML,
+        reply_markup=get_expire_time_menu()
+    )
+
+async def handle_set_available_expiry(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    
+    if not is_admin(user.id) or 'expire_settings' not in get_admin_permissions(user.id):
+        return
+    
+    context.user_data['awaiting_expiry_setting'] = 'available'
+    await update.message.reply_text(
+        "📋 Set Available Tasks Expiry\n\n"
+        "Enter number of hours for available tasks expiry (1-168):\n"
+        f"Current: {get_available_task_expiry_hours()} hours\n\n"
+        "This controls how long a newly added task sits before expiring (available → failed).",
+        reply_markup=ReplyKeyboardMarkup([["❌ Cancel"]], resize_keyboard=True)
+    )
+
+async def handle_set_pending_otp_expiry(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    
+    if not is_admin(user.id) or 'expire_settings' not in get_admin_permissions(user.id):
+        return
+    
+    context.user_data['awaiting_expiry_setting'] = 'pending_otp'
+    await update.message.reply_text(
+        "⏳ Set Pending OTP Expiry\n\n"
+        "Enter number of hours for pending OTP expiry (1-48):\n"
+        f"Current: {get_pending_otp_expiry_hours()} hours\n\n"
+        "This controls how long a task stays in pending_otp status before expiring.",
+        reply_markup=ReplyKeyboardMarkup([["❌ Cancel"]], resize_keyboard=True)
+    )
+
+async def handle_set_assigned_expiry(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    
+    if not is_admin(user.id) or 'expire_settings' not in get_admin_permissions(user.id):
+        return
+    
+    context.user_data['awaiting_expiry_setting'] = 'assigned'
+    await update.message.reply_text(
+        "✅ Set Assigned Tasks Expiry\n\n"
+        "Enter number of hours for assigned tasks expiry (1-168):\n"
+        f"Current: {get_assigned_task_expiry_hours()} hours\n\n"
+        "This controls how long a user has to complete a task after taking it.",
+        reply_markup=ReplyKeyboardMarkup([["❌ Cancel"]], resize_keyboard=True)
+    )
+
+async def handle_set_warning_hours(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    
+    if not is_admin(user.id) or 'expire_settings' not in get_admin_permissions(user.id):
+        return
+    
+    context.user_data['awaiting_expiry_setting'] = 'warning'
+    await update.message.reply_text(
+        "🔔 Set Warning Hours Before Expiry\n\n"
+        "Enter number of hours before expiry to warn admin (1-48):\n"
+        f"Current: {get_warning_hours_before()} hours\n\n"
+        "You will receive warnings when tasks are about to expire.",
+        reply_markup=ReplyKeyboardMarkup([["❌ Cancel"]], resize_keyboard=True)
+    )
+
+async def handle_expiry_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    message = update.message
+    text = message.text.strip()
+    
+    if 'awaiting_expiry_setting' in context.user_data:
+        try:
+            hours = int(text)
+            setting_type = context.user_data['awaiting_expiry_setting']
+            
+            if hours < 1 or hours > 168:
+                await message.reply_text(
+                    "❌ Invalid hours! Must be between 1 and 168.",
+                    reply_markup=get_expire_time_menu()
+                )
+                return
+            
+            if setting_type == 'available':
+                update_available_task_expiry(hours)
+                await message.reply_text(
+                    f"✅ Available Tasks Expiry Updated!\n\n"
+                    f"📋 Available tasks will now expire after {hours} hours.",
+                    reply_markup=get_expire_time_menu()
+                )
+            elif setting_type == 'pending_otp':
+                if hours > 48:
+                    await message.reply_text(
+                        "❌ Pending OTP expiry cannot exceed 48 hours!",
+                        reply_markup=get_expire_time_menu()
+                    )
+                    return
+                update_pending_otp_expiry(hours)
+                await message.reply_text(
+                    f"✅ Pending OTP Expiry Updated!\n\n"
+                    f"⏳ Pending OTP tasks will now expire after {hours} hours.",
+                    reply_markup=get_expire_time_menu()
+                )
+            elif setting_type == 'assigned':
+                update_assigned_task_expiry(hours)
+                await message.reply_text(
+                    f"✅ Assigned Tasks Expiry Updated!\n\n"
+                    f"✅ Assigned tasks will now expire after {hours} hours.",
+                    reply_markup=get_expire_time_menu()
+                )
+            elif setting_type == 'warning':
+                if hours > 48:
+                    await message.reply_text(
+                        "❌ Warning hours cannot exceed 48!",
+                        reply_markup=get_expire_time_menu()
+                    )
+                    return
+                update_warning_hours_before(hours)
+                await message.reply_text(
+                    f"✅ Warning Hours Updated!\n\n"
+                    f"🔔 You will now be warned {hours} hours before tasks expire.",
+                    reply_markup=get_expire_time_menu()
+                )
+            
+            del context.user_data['awaiting_expiry_setting']
+            
+        except ValueError:
+            await message.reply_text(
+                "❌ Invalid number! Please enter a valid number of hours:",
+                reply_markup=get_expire_time_menu()
+            )
+        return
+
+# ==================== AVAILABLE TASKS VIEW ====================
+async def handle_available_tasks(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    
+    if not is_admin(user.id) or 'available' not in get_admin_permissions(user.id):
+        await update.message.reply_text(
+            "❌ You don't have permission to view available tasks!",
+            reply_markup=get_admin_menu_by_permissions(user.id)
+        )
+        return
+    
+    tasks = get_available_tasks_for_admin()
+    
+    if not tasks:
+        await update.message.reply_text(
+            "📭 No available tasks found.",
+            reply_markup=get_admin_menu_by_permissions(user.id)
+        )
+        return
+    
+    response = "📋 Available Tasks\n\n"
+    
+    for i, task in enumerate(tasks[:20], 1):
+        response += (
+            f"{i}. 📧 <code>{task['address']}@gmail.com</code>\n"
+            f"   👤 Name: <code>{task['name']}</code>\n"
+            f"   🔐 Password: <code>{task['password']}</code>\n"
+            f"   💰 Reward: ETB{task['reward']:.2f}\n"
+            f"   🆔 ID: <code>{task['unique_task_id']}</code>\n"
+            f"   📅 Created: {task['created_date'].split()[0]}\n\n"
+        )
+    
+    if len(tasks) > 20:
+        response += f"\n... and {len(tasks) - 20} more tasks"
+    
+    response += "\n💡 Click on any ID or email to copy!\n"
+    response += f"⚠️ These tasks will expire in {get_available_task_expiry_hours()} hours."
+    
+    sent_msg = await update.message.reply_text(
+        response,
+        parse_mode=ParseMode.HTML,
+        reply_markup=get_admin_menu_by_permissions(user.id)
+    )
+    await queue_message_for_deletion(user.id, sent_msg.message_id)
+
+# ==================== PENDING OTP TASKS VIEW ====================
+async def handle_pending_otp_tasks(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    
+    if not is_admin(user.id) or 'pending_otp' not in get_admin_permissions(user.id):
+        await update.message.reply_text(
+            "❌ You don't have permission to view pending OTP tasks!",
+            reply_markup=get_admin_menu_by_permissions(user.id)
+        )
+        return
+    
+    tasks = get_pending_otp_tasks_for_admin()
+    
+    if not tasks:
+        await update.message.reply_text(
+            "📭 No pending OTP tasks found.",
+            reply_markup=get_admin_menu_by_permissions(user.id)
+        )
+        return
+    
+    response = "⏳ Pending OTP Tasks\n\n"
+    
+    for i, task in enumerate(tasks[:20], 1):
+        response += (
+            f"{i}. 📧 <code>{task['address']}@gmail.com</code>\n"
+            f"   👤 Name: <code>{task['name']}</code>\n"
+            f"   👤 User: @{task['username'] or 'N/A'} (<code>{task['user_id']}</code>)\n"
+            f"   🆔 ID: <code>{task['unique_task_id']}</code>\n"
+            f"   ⏰ Completed: {task['completed_time'].split()[0]}\n\n"
+        )
+    
+    if len(tasks) > 20:
+        response += f"\n... and {len(tasks) - 20} more tasks"
+    
+    response += "\n💡 Click on any ID or email to copy!\n"
+    response += f"⚠️ These tasks will expire in {get_pending_otp_expiry_hours()} hours.\n"
+    response += "💡 Use '🔑 Generate OTP' to help users who are stuck."
+    
+    sent_msg = await update.message.reply_text(
+        response,
+        parse_mode=ParseMode.HTML,
+        reply_markup=get_admin_menu_by_permissions(user.id)
+    )
+    await queue_message_for_deletion(user.id, sent_msg.message_id)
+
+# ==================== EXPIRED TASKS VIEW ====================
+async def handle_expired_tasks(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    
+    if not is_admin(user.id) or 'expired' not in get_admin_permissions(user.id):
+        await update.message.reply_text(
+            "❌ You don't have permission to view expired tasks!",
+            reply_markup=get_admin_menu_by_permissions(user.id)
+        )
+        return
+    
+    tasks = get_expired_tasks_for_admin()
+    
+    if not tasks:
+        await update.message.reply_text(
+            "📭 No expired tasks found.",
+            reply_markup=get_admin_menu_by_permissions(user.id)
+        )
+        return
+    
+    response = "💀 Expired Tasks\n\n"
+    
+    for i, task in enumerate(tasks[:20], 1):
+        response += (
+            f"{i}. 📧 <code>{task['address']}@gmail.com</code>\n"
+            f"   👤 Name: <code>{task['name']}</code>\n"
+            f"   🆔 ID: <code>{task['unique_task_id']}</code>\n"
+            f"   📅 Created: {task['created_date'].split()[0]}\n\n"
+        )
+    
+    if len(tasks) > 20:
+        response += f"\n... and {len(tasks) - 20} more tasks"
+    
+    response += "\n💡 Click on any ID or email to copy!\n"
+    response += "⚠️ These tasks will be permanently deleted after 24 hours."
+    
+    sent_msg = await update.message.reply_text(
+        response,
+        parse_mode=ParseMode.HTML,
+        reply_markup=get_admin_menu_by_permissions(user.id)
+    )
+    await queue_message_for_deletion(user.id, sent_msg.message_id)
+
+# ==================== PENDING TASKS HANDLERS ====================
 async def handle_pending_tasks(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     
@@ -3485,7 +4418,7 @@ async def show_pending_task_details(update: Update, context: ContextTypes.DEFAUL
     
     response = (
         f"⏳ Pending Task Review\n\n"
-        f"📋 Task ID: #{task['task_id']}\n"
+        f"📋 Task ID: {task['task_id']}\n"
         f"👤 Completed By: @{task['username']} (ID: <code>{task['assigned_to']}</code>)\n"
         f"⏰ Completed: {task['completed_time']}\n\n"
         f"📝 Task Details:\n"
@@ -3505,18 +4438,26 @@ async def show_pending_task_details(update: Update, context: ContextTypes.DEFAUL
     sent_msg = await update.message.reply_text(
         response,
         parse_mode=ParseMode.HTML,
-        reply_markup=get_admin_task_review_menu(task['task_id'])
+        reply_markup=get_admin_task_review_menu()
     )
     await queue_message_for_deletion(user.id, sent_msg.message_id)
+    
+    context.user_data['current_review_task_id'] = task_id
 
 async def handle_admin_task_action(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text
+    task_id = context.user_data.get('current_review_task_id')
+    
+    if not task_id:
+        await update.message.reply_text(
+            "No task selected for review. Please go back to pending tasks.",
+            reply_markup=get_admin_menu_by_permissions(update.effective_user.id)
+        )
+        return
     
     if "Approve" in text:
-        task_id = int(text.split('#')[1])
         await handle_task_approve(update, context, task_id)
-    else:
-        task_id = int(text.split('#')[1])
+    elif "Reject" in text:
         await handle_task_reject(update, context, task_id)
 
 async def handle_task_approve(update: Update, context: ContextTypes.DEFAULT_TYPE, task_id: int):
@@ -3535,13 +4476,13 @@ async def handle_task_approve(update: Update, context: ContextTypes.DEFAULT_TYPE
         if success:
             await send_user_notification(context, task_dict['assigned_to'], message)
             sent_msg = await update.message.reply_text(
-                f"✅ Task #{task_id} approved!",
+                f"✅ Task approved!",
                 reply_markup=get_admin_menu_by_permissions(user.id)
             )
             await queue_message_for_deletion(user.id, sent_msg.message_id)
         else:
             await update.message.reply_text(
-                f"❌ Failed to approve task #{task_id}",
+                f"❌ Failed to approve task",
                 reply_markup=get_admin_menu_by_permissions(user.id)
             )
 
@@ -3559,13 +4500,13 @@ async def handle_task_reject(update: Update, context: ContextTypes.DEFAULT_TYPE,
         if success:
             await send_user_notification(context, task_dict['assigned_to'], default_message)
             sent_msg = await update.message.reply_text(
-                f"❌ Task #{task_id} rejected!",
+                f"❌ Task rejected!",
                 reply_markup=get_admin_menu_by_permissions(user.id)
             )
             await queue_message_for_deletion(user.id, sent_msg.message_id)
         else:
             await update.message.reply_text(
-                f"❌ Failed to reject task #{task_id}",
+                f"❌ Failed to reject task",
                 reply_markup=get_admin_menu_by_permissions(user.id)
             )
 
@@ -3582,6 +4523,7 @@ async def handle_next_pending_task(update: Update, context: ContextTypes.DEFAULT
         
     await show_pending_task_details(update, context, context.user_data['pending_index'])
 
+# ==================== MANAGE USERS HANDLERS ====================
 async def handle_manage_users(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     
@@ -3678,7 +4620,8 @@ async def handle_admin_view_user_details(update: Update, context: ContextTypes.D
     
     text = update.message.text
     try:
-        user_id = int(text.split('#')[1])
+        parts = text.split()
+        user_id = int(parts[-1])
     except:
         await update.message.reply_text(
             "Invalid user ID.",
@@ -3736,13 +4679,14 @@ async def handle_admin_balance_action(update: Update, context: ContextTypes.DEFA
         return
     
     text = update.message.text
+    parts = text.split()
+    action = parts[0]
+    user_id = int(parts[-1])
     
-    if "Add" in text:
-        user_id = int(text.split('#')[1])
-        action = 'add'
+    if "Add" in text or action == "💰":
+        action_type = 'add'
     else:
-        user_id = int(text.split('#')[1])
-        action = 'subtract'
+        action_type = 'subtract'
     
     user_data = get_user(user_id)
     if not user_data:
@@ -3753,13 +4697,13 @@ async def handle_admin_balance_action(update: Update, context: ContextTypes.DEFA
         return
     
     context.user_data['balance_user_id'] = user_id
-    context.user_data['balance_action'] = action
+    context.user_data['balance_action'] = action_type
     
     await update.message.reply_text(
-        f"Adjust Balance for User #{user_id}\n"
+        f"Adjust Balance for User {user_id}\n"
         f"👤 @{user_data['username'] or 'N/A'}\n"
         f"💰 Current Balance: ETB{user_data['balance']:.2f}\n\n"
-        f"Enter amount to {action}:\n"
+        f"Enter amount to {action_type}:\n"
         f"(Also enter reason after amount, separated by comma)\n\n"
         f"Example: 10.00, Bonus for good work",
         reply_markup=ReplyKeyboardMarkup([["❌ Cancel"]], resize_keyboard=True)
@@ -3775,7 +4719,8 @@ async def handle_admin_message_user(update: Update, context: ContextTypes.DEFAUL
     
     text = update.message.text
     try:
-        user_id = int(text.split('#')[1])
+        parts = text.split()
+        user_id = int(parts[-1])
     except:
         await update.message.reply_text(
             "Invalid user ID.",
@@ -3795,7 +4740,7 @@ async def handle_admin_message_user(update: Update, context: ContextTypes.DEFAUL
     context.user_data['awaiting_user_message'] = True
     
     await update.message.reply_text(
-        f"📨 Message User #{user_id}\n"
+        f"📨 Message User {user_id}\n"
         f"👤 @{user_data['username'] or 'N/A'}\n\n"
         f"Enter message to send:",
         reply_markup=ReplyKeyboardMarkup([["❌ Cancel"]], resize_keyboard=True)
@@ -3834,7 +4779,7 @@ async def handle_statistics(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"✅ Active Today: {active_today}\n\n"
         f"📋 Tasks:\n"
         f"📊 Total Tasks: {total_tasks}\n"
-        f"✅ Completed: {completed_tasks}\n"
+        f"✅ Completed (Approved): {completed_tasks}\n"
         f"📈 Completion Rate: {(completed_tasks/total_tasks*100 if total_tasks > 0 else 0):.1f}%\n\n"
         f"📊 Task Status:\n"
         f"📭 Available: {task_stats.get('available_tasks', 0)}\n"
@@ -3990,7 +4935,40 @@ async def handle_admin_settings_menu(update: Update, context: ContextTypes.DEFAU
         reply_markup=get_admin_settings_menu()
     )
 
-# ==================== EXPORT TASKS HANDLERS (FIXED) ====================
+# ==================== OTP TOGGLE HANDLER ====================
+async def handle_toggle_otp(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    
+    if not is_admin(user.id) or 'otp_toggle' not in get_admin_permissions(user.id):
+        await update.message.reply_text(
+            "❌ You don't have permission to toggle OTP verification!",
+            reply_markup=get_admin_menu_by_permissions(user.id)
+        )
+        return
+    
+    current_status = is_otp_enabled()
+    new_status = '0' if current_status else '1'
+    
+    update_system_setting('otp_enabled', new_status)
+    
+    status_text = "ENABLED ✅" if not current_status else "DISABLED ❌"
+    new_status_text = "ON" if not current_status else "OFF"
+    
+    await broadcast_message(context, 
+        f"🔐 <b>OTP Verification Update</b>\n\n"
+        f"OTP verification has been turned {new_status_text}.\n\n"
+        f"{'You will now receive OTP codes to verify task completion.' if not current_status else 'You can now submit tasks directly without OTP codes.'}"
+    )
+    
+    await update.message.reply_text(
+        f"🔐 OTP Verification {status_text}\n\n"
+        f"OTP is now turned {new_status_text}.\n"
+        f"Users have been notified.\n\n"
+        f"{'Users must now enter OTP codes to complete tasks.' if not current_status else 'Users can now submit tasks directly without OTP codes.'}",
+        reply_markup=get_admin_settings_menu()
+    )
+
+# ==================== EXPORT TASKS HANDLERS (with auto-delete after download) ====================
 async def handle_export_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     
@@ -4003,7 +4981,101 @@ async def handle_export_menu(update: Update, context: ContextTypes.DEFAULT_TYPE)
     
     await update.message.reply_text(
         "📥 Export Tasks\n\n"
-        "Select an option:",
+        "Select an option:\n\n"
+        f"⚠️ <b>Important:</b> After downloading, tasks will be automatically deleted in {DOWNLOAD_DELETE_HOURS} hours!\n\n"
+        "• <b>Available Tasks</b> - Tasks waiting to be taken\n"
+        "• <b>Pending OTP</b> - Tasks waiting for OTP verification\n"
+        "• <b>Completed</b> - Approved tasks\n"
+        "• <b>Expired</b> - Expired tasks\n"
+        "• <b>Failed</b> - Rejected tasks\n"
+        "• <b>Pending Review</b> - Tasks awaiting admin approval",
+        parse_mode=ParseMode.HTML,
+        reply_markup=get_admin_export_menu()
+    )
+
+async def handle_export_available_tasks(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    
+    if not is_admin(user.id) or 'export' not in get_admin_permissions(user.id):
+        await update.message.reply_text(
+            "❌ You don't have permission to export tasks!",
+            reply_markup=get_admin_menu_by_permissions(user.id)
+        )
+        return
+    
+    excel_data, count, task_ids = export_available_tasks_to_excel()
+    
+    if count == 0:
+        await update.message.reply_text(
+            "📭 No available tasks to export!",
+            reply_markup=get_admin_export_menu()
+        )
+        return
+    
+    mark_tasks_for_deletion(task_ids)
+    
+    filename = f"available_tasks_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
+    
+    await context.bot.send_document(
+        chat_id=user.id,
+        document=excel_data,
+        filename=filename,
+        caption=f"📭 Available Tasks Export\n"
+                f"📊 Total: {count} tasks\n"
+                f"📅 Exported: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n"
+                f"⚠️ <b>These tasks will be automatically deleted in {DOWNLOAD_DELETE_HOURS} hours!</b>\n"
+                f"🗑️ Deletion time: {(datetime.now() + timedelta(hours=DOWNLOAD_DELETE_HOURS)).strftime('%Y-%m-%d %H:%M:%S')}",
+        parse_mode=ParseMode.HTML
+    )
+    
+    await update.message.reply_text(
+        f"✅ Exported {count} available tasks!\n\n"
+        f"⚠️ <b>These tasks will be deleted in {DOWNLOAD_DELETE_HOURS} hours!</b>\n"
+        f"📅 Deletion scheduled for: {(datetime.now() + timedelta(hours=DOWNLOAD_DELETE_HOURS)).strftime('%Y-%m-%d %H:%M:%S')}",
+        parse_mode=ParseMode.HTML,
+        reply_markup=get_admin_export_menu()
+    )
+
+async def handle_export_pending_otp_tasks(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    
+    if not is_admin(user.id) or 'export' not in get_admin_permissions(user.id):
+        await update.message.reply_text(
+            "❌ You don't have permission to export tasks!",
+            reply_markup=get_admin_menu_by_permissions(user.id)
+        )
+        return
+    
+    excel_data, count, task_ids = export_pending_otp_tasks_to_excel()
+    
+    if count == 0:
+        await update.message.reply_text(
+            "📭 No pending OTP tasks to export!",
+            reply_markup=get_admin_export_menu()
+        )
+        return
+    
+    mark_tasks_for_deletion(task_ids)
+    
+    filename = f"pending_otp_tasks_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
+    
+    await context.bot.send_document(
+        chat_id=user.id,
+        document=excel_data,
+        filename=filename,
+        caption=f"⏳ Pending OTP Tasks Export\n"
+                f"📊 Total: {count} tasks\n"
+                f"📅 Exported: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n"
+                f"⚠️ <b>These tasks will be automatically deleted in {DOWNLOAD_DELETE_HOURS} hours!</b>\n"
+                f"🗑️ Deletion time: {(datetime.now() + timedelta(hours=DOWNLOAD_DELETE_HOURS)).strftime('%Y-%m-%d %H:%M:%S')}",
+        parse_mode=ParseMode.HTML
+    )
+    
+    await update.message.reply_text(
+        f"✅ Exported {count} pending OTP tasks!\n\n"
+        f"⚠️ <b>These tasks will be deleted in {DOWNLOAD_DELETE_HOURS} hours!</b>\n"
+        f"📅 Deletion scheduled for: {(datetime.now() + timedelta(hours=DOWNLOAD_DELETE_HOURS)).strftime('%Y-%m-%d %H:%M:%S')}",
+        parse_mode=ParseMode.HTML,
         reply_markup=get_admin_export_menu()
     )
 
@@ -4017,73 +5089,38 @@ async def handle_export_completed_tasks(update: Update, context: ContextTypes.DE
         )
         return
     
-    try:
-        csv_data, count = export_completed_tasks_to_csv()
-        
-        if count == 0:
-            await update.message.reply_text(
-                "📭 No completed tasks to export!",
-                reply_markup=get_admin_export_menu()
-            )
-            return
-        
-        filename = f"completed_tasks_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
-        
-        await context.bot.send_document(
-            chat_id=user.id,
-            document=csv_data,
-            filename=filename,
-            caption=f"✅ Completed Tasks Export\n📊 Total: {count} tasks\n📅 Exported: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
-        )
-        
-        await update.message.reply_text(
-            f"✅ Exported {count} completed tasks!",
-            reply_markup=get_admin_export_menu()
-        )
-    except Exception as e:
-        await update.message.reply_text(
-            f"❌ Error exporting tasks: {str(e)}",
-            reply_markup=get_admin_export_menu()
-        )
-
-async def handle_export_failed_tasks(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
+    excel_data, count, task_ids = export_completed_tasks_to_excel()
     
-    if not is_admin(user.id) or 'export' not in get_admin_permissions(user.id):
+    if count == 0:
         await update.message.reply_text(
-            "❌ You don't have permission to export tasks!",
-            reply_markup=get_admin_menu_by_permissions(user.id)
+            "📭 No completed tasks to export!",
+            reply_markup=get_admin_export_menu()
         )
         return
     
-    try:
-        csv_data, count = export_failed_tasks_to_csv()
-        
-        if count == 0:
-            await update.message.reply_text(
-                "📭 No failed tasks to export!",
-                reply_markup=get_admin_export_menu()
-            )
-            return
-        
-        filename = f"failed_tasks_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
-        
-        await context.bot.send_document(
-            chat_id=user.id,
-            document=csv_data,
-            filename=filename,
-            caption=f"❌ Failed Tasks Export\n📊 Total: {count} tasks\n📅 Exported: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
-        )
-        
-        await update.message.reply_text(
-            f"✅ Exported {count} failed tasks!",
-            reply_markup=get_admin_export_menu()
-        )
-    except Exception as e:
-        await update.message.reply_text(
-            f"❌ Error exporting tasks: {str(e)}",
-            reply_markup=get_admin_export_menu()
-        )
+    mark_tasks_for_deletion(task_ids)
+    
+    filename = f"completed_tasks_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
+    
+    await context.bot.send_document(
+        chat_id=user.id,
+        document=excel_data,
+        filename=filename,
+        caption=f"✅ Completed Tasks Export\n"
+                f"📊 Total: {count} tasks\n"
+                f"📅 Exported: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n"
+                f"⚠️ <b>These tasks will be automatically deleted in {DOWNLOAD_DELETE_HOURS} hours!</b>\n"
+                f"🗑️ Deletion time: {(datetime.now() + timedelta(hours=DOWNLOAD_DELETE_HOURS)).strftime('%Y-%m-%d %H:%M:%S')}",
+        parse_mode=ParseMode.HTML
+    )
+    
+    await update.message.reply_text(
+        f"✅ Exported {count} completed tasks!\n\n"
+        f"⚠️ <b>These tasks will be deleted in {DOWNLOAD_DELETE_HOURS} hours!</b>\n"
+        f"📅 Deletion scheduled for: {(datetime.now() + timedelta(hours=DOWNLOAD_DELETE_HOURS)).strftime('%Y-%m-%d %H:%M:%S')}",
+        parse_mode=ParseMode.HTML,
+        reply_markup=get_admin_export_menu()
+    )
 
 async def handle_export_expired_tasks(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
@@ -4095,36 +5132,126 @@ async def handle_export_expired_tasks(update: Update, context: ContextTypes.DEFA
         )
         return
     
-    try:
-        csv_data, count = export_expired_tasks_to_csv()
-        
-        if count == 0:
-            await update.message.reply_text(
-                "📭 No expired tasks to export!",
-                reply_markup=get_admin_export_menu()
-            )
-            return
-        
-        filename = f"expired_tasks_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
-        
-        await context.bot.send_document(
-            chat_id=user.id,
-            document=csv_data,
-            filename=filename,
-            caption=f"💀 Expired Tasks Export\n📊 Total: {count} tasks\n📅 Exported: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
-        )
-        
+    excel_data, count, task_ids = export_expired_tasks_to_excel()
+    
+    if count == 0:
         await update.message.reply_text(
-            f"✅ Exported {count} expired tasks!",
+            "📭 No expired tasks to export!",
             reply_markup=get_admin_export_menu()
         )
-    except Exception as e:
-        await update.message.reply_text(
-            f"❌ Error exporting tasks: {str(e)}",
-            reply_markup=get_admin_export_menu()
-        )
+        return
+    
+    mark_tasks_for_deletion(task_ids)
+    
+    filename = f"expired_tasks_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
+    
+    await context.bot.send_document(
+        chat_id=user.id,
+        document=excel_data,
+        filename=filename,
+        caption=f"💀 Expired Tasks Export\n"
+                f"📊 Total: {count} tasks\n"
+                f"📅 Exported: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n"
+                f"⚠️ <b>These tasks will be automatically deleted in {DOWNLOAD_DELETE_HOURS} hours!</b>\n"
+                f"🗑️ Deletion time: {(datetime.now() + timedelta(hours=DOWNLOAD_DELETE_HOURS)).strftime('%Y-%m-%d %H:%M:%S')}",
+        parse_mode=ParseMode.HTML
+    )
+    
+    await update.message.reply_text(
+        f"✅ Exported {count} expired tasks!\n\n"
+        f"⚠️ <b>These tasks will be deleted in {DOWNLOAD_DELETE_HOURS} hours!</b>\n"
+        f"📅 Deletion scheduled for: {(datetime.now() + timedelta(hours=DOWNLOAD_DELETE_HOURS)).strftime('%Y-%m-%d %H:%M:%S')}",
+        parse_mode=ParseMode.HTML,
+        reply_markup=get_admin_export_menu()
+    )
 
-# ==================== DELETE TASKS HANDLERS (FIXED) ====================
+async def handle_export_failed_tasks(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    
+    if not is_admin(user.id) or 'export' not in get_admin_permissions(user.id):
+        await update.message.reply_text(
+            "❌ You don't have permission to export tasks!",
+            reply_markup=get_admin_menu_by_permissions(user.id)
+        )
+        return
+    
+    excel_data, count, task_ids = export_failed_tasks_to_excel()
+    
+    if count == 0:
+        await update.message.reply_text(
+            "📭 No failed tasks to export!",
+            reply_markup=get_admin_export_menu()
+        )
+        return
+    
+    mark_tasks_for_deletion(task_ids)
+    
+    filename = f"failed_tasks_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
+    
+    await context.bot.send_document(
+        chat_id=user.id,
+        document=excel_data,
+        filename=filename,
+        caption=f"❌ Failed Tasks Export\n"
+                f"📊 Total: {count} tasks\n"
+                f"📅 Exported: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n"
+                f"⚠️ <b>These tasks will be automatically deleted in {DOWNLOAD_DELETE_HOURS} hours!</b>\n"
+                f"🗑️ Deletion time: {(datetime.now() + timedelta(hours=DOWNLOAD_DELETE_HOURS)).strftime('%Y-%m-%d %H:%M:%S')}",
+        parse_mode=ParseMode.HTML
+    )
+    
+    await update.message.reply_text(
+        f"✅ Exported {count} failed tasks!\n\n"
+        f"⚠️ <b>These tasks will be deleted in {DOWNLOAD_DELETE_HOURS} hours!</b>\n"
+        f"📅 Deletion scheduled for: {(datetime.now() + timedelta(hours=DOWNLOAD_DELETE_HOURS)).strftime('%Y-%m-%d %H:%M:%S')}",
+        parse_mode=ParseMode.HTML,
+        reply_markup=get_admin_export_menu()
+    )
+
+async def handle_export_pending_review_tasks(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    
+    if not is_admin(user.id) or 'export' not in get_admin_permissions(user.id):
+        await update.message.reply_text(
+            "❌ You don't have permission to export tasks!",
+            reply_markup=get_admin_menu_by_permissions(user.id)
+        )
+        return
+    
+    excel_data, count, task_ids = export_pending_review_tasks_to_excel()
+    
+    if count == 0:
+        await update.message.reply_text(
+            "📭 No pending review tasks to export!",
+            reply_markup=get_admin_export_menu()
+        )
+        return
+    
+    mark_tasks_for_deletion(task_ids)
+    
+    filename = f"pending_review_tasks_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
+    
+    await context.bot.send_document(
+        chat_id=user.id,
+        document=excel_data,
+        filename=filename,
+        caption=f"⏳ Pending Review Tasks Export\n"
+                f"📊 Total: {count} tasks\n"
+                f"📅 Exported: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n"
+                f"⚠️ <b>These tasks will be automatically deleted in {DOWNLOAD_DELETE_HOURS} hours!</b>\n"
+                f"🗑️ Deletion time: {(datetime.now() + timedelta(hours=DOWNLOAD_DELETE_HOURS)).strftime('%Y-%m-%d %H:%M:%S')}",
+        parse_mode=ParseMode.HTML
+    )
+    
+    await update.message.reply_text(
+        f"✅ Exported {count} pending review tasks!\n\n"
+        f"⚠️ <b>These tasks will be deleted in {DOWNLOAD_DELETE_HOURS} hours!</b>\n"
+        f"📅 Deletion scheduled for: {(datetime.now() + timedelta(hours=DOWNLOAD_DELETE_HOURS)).strftime('%Y-%m-%d %H:%M:%S')}",
+        parse_mode=ParseMode.HTML,
+        reply_markup=get_admin_export_menu()
+    )
+
+# ==================== DELETE TASKS HANDLERS ====================
 async def handle_delete_tasks_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     
@@ -4152,11 +5279,52 @@ async def handle_delete_single_completed_task(update: Update, context: ContextTy
         return
     
     context.user_data['awaiting_delete_single_task'] = True
+    context.user_data['delete_task_type'] = 'completed'
     await update.message.reply_text(
         "🗑️ Delete Single Completed Task\n\n"
         "Enter the Task ID (unique_task_id) to delete:\n"
         "Example: 18012345\n\n"
         "💡 You can find Task ID in Completed Tasks list.",
+        reply_markup=ReplyKeyboardMarkup([["❌ Cancel"]], resize_keyboard=True)
+    )
+
+async def handle_delete_single_available_task(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    
+    if not is_admin(user.id) or 'delete' not in get_admin_permissions(user.id):
+        await update.message.reply_text(
+            "❌ You don't have permission to delete tasks!",
+            reply_markup=get_admin_menu_by_permissions(user.id)
+        )
+        return
+    
+    context.user_data['awaiting_delete_single_task'] = True
+    context.user_data['delete_task_type'] = 'available'
+    await update.message.reply_text(
+        "🗑️ Delete Single Available Task\n\n"
+        "Enter the Task ID (unique_task_id) to delete:\n"
+        "Example: 18012345\n\n"
+        "💡 You can find Task ID in Available Tasks list.",
+        reply_markup=ReplyKeyboardMarkup([["❌ Cancel"]], resize_keyboard=True)
+    )
+
+async def handle_delete_single_pending_otp_task(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    
+    if not is_admin(user.id) or 'delete' not in get_admin_permissions(user.id):
+        await update.message.reply_text(
+            "❌ You don't have permission to delete tasks!",
+            reply_markup=get_admin_menu_by_permissions(user.id)
+        )
+        return
+    
+    context.user_data['awaiting_delete_single_task'] = True
+    context.user_data['delete_task_type'] = 'pending_otp'
+    await update.message.reply_text(
+        "🗑️ Delete Single Pending OTP Task\n\n"
+        "Enter the Task ID (unique_task_id) to delete:\n"
+        "Example: 18012345\n\n"
+        "💡 You can find Task ID in Pending OTP Tasks list.",
         reply_markup=ReplyKeyboardMarkup([["❌ Cancel"]], resize_keyboard=True)
     )
 
@@ -4194,6 +5362,40 @@ async def handle_delete_all_failed_tasks(update: Update, context: ContextTypes.D
         reply_markup=get_admin_delete_tasks_menu()
     )
 
+async def handle_delete_all_available_tasks(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    
+    if not is_admin(user.id) or 'delete' not in get_admin_permissions(user.id):
+        await update.message.reply_text(
+            "❌ You don't have permission to delete tasks!",
+            reply_markup=get_admin_menu_by_permissions(user.id)
+        )
+        return
+    
+    count, msg = delete_all_available_tasks(user.id)
+    
+    await update.message.reply_text(
+        msg,
+        reply_markup=get_admin_delete_tasks_menu()
+    )
+
+async def handle_delete_all_pending_otp_tasks(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    
+    if not is_admin(user.id) or 'delete' not in get_admin_permissions(user.id):
+        await update.message.reply_text(
+            "❌ You don't have permission to delete tasks!",
+            reply_markup=get_admin_menu_by_permissions(user.id)
+        )
+        return
+    
+    count, msg = delete_all_pending_otp_tasks(user.id)
+    
+    await update.message.reply_text(
+        msg,
+        reply_markup=get_admin_delete_tasks_menu()
+    )
+
 async def handle_delete_all_expired_tasks(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     
@@ -4215,9 +5417,17 @@ async def handle_delete_single_task_input(update: Update, context: ContextTypes.
     user = update.effective_user
     message = update.message
     task_id = message.text.strip()
+    task_type = context.user_data.get('delete_task_type', 'completed')
     
     if 'awaiting_delete_single_task' in context.user_data:
-        success, msg = delete_single_completed_task(task_id, user.id)
+        if task_type == 'completed':
+            success, msg = delete_single_completed_task(task_id, user.id)
+        elif task_type == 'available':
+            success, msg = delete_single_available_task(task_id, user.id)
+        elif task_type == 'pending_otp':
+            success, msg = delete_single_pending_otp_task(task_id, user.id)
+        else:
+            success, msg = False, "❌ Invalid task type!"
         
         await message.reply_text(
             msg,
@@ -4225,6 +5435,7 @@ async def handle_delete_single_task_input(update: Update, context: ContextTypes.
         )
         
         del context.user_data['awaiting_delete_single_task']
+        del context.user_data['delete_task_type']
         return
 
 # ==================== MILESTONE BONUSES HANDLERS ====================
@@ -4271,7 +5482,6 @@ async def handle_milestone_enable(update: Update, context: ContextTypes.DEFAULT_
     
     update_milestone_settings(True, user.id)
     
-    # Broadcast to all users
     await broadcast_milestone_update(context, True)
     
     await update.message.reply_text(
@@ -5176,7 +6386,7 @@ async def handle_pending_payouts_modified(update: Update, context: ContextTypes.
             method_display = payout_dict['payout_method'].upper()
         
         response += (
-            f"{i}. <b>Payout ID:</b> #{payout_dict['payout_id']}\n"
+            f"{i}. <b>Payout ID:</b> {payout_dict['payout_id']}\n"
             f"   👤 <b>User ID:</b> <code>{payout_dict['user_id']}</code>\n"
             f"   👤 <b>Username:</b> @{payout_dict['username']} (<code>{payout_dict['first_name']}</code>)\n"
             f"   💰 <b>Amount:</b> ETB{payout_dict['amount']:.2f}\n"
@@ -5191,9 +6401,9 @@ async def handle_pending_payouts_modified(update: Update, context: ContextTypes.
     keyboard = []
     for payout in rows[:5]:
         keyboard.append([
-            InlineKeyboardButton(f"✅ Approve #{payout['payout_id']}", 
+            InlineKeyboardButton(f"✅ Approve {payout['payout_id']}", 
                                callback_data=f"approve_payout_{payout['payout_id']}"),
-            InlineKeyboardButton(f"❌ Reject #{payout['payout_id']}", 
+            InlineKeyboardButton(f"❌ Reject {payout['payout_id']}", 
                                callback_data=f"reject_payout_{payout['payout_id']}")
         ])
     
@@ -5229,13 +6439,13 @@ async def handle_payout_default_approve(update: Update, context: ContextTypes.DE
                 await send_user_notification(context, payout_dict['user_id'], message_text)
                 await post_payout_to_channel(context, payout_dict['user_id'], amount, payout_dict['payout_method'], payout_dict['payout_details'])
                 sent_msg = await update.message.reply_text(
-                    f"✅ Payout #{payout_id} approved!",
+                    f"✅ Payout {payout_id} approved!",
                     reply_markup=get_admin_menu_by_permissions(user.id)
                 )
                 await queue_message_for_deletion(user.id, sent_msg.message_id)
             else:
                 await update.message.reply_text(
-                    f"❌ Failed to approve payout #{payout_id}",
+                    f"❌ Failed to approve payout {payout_id}",
                     reply_markup=get_admin_menu_by_permissions(user.id)
                 )
         
@@ -5253,7 +6463,7 @@ async def handle_payout_image_approve(update: Update, context: ContextTypes.DEFA
         context.user_data['payout_image_id'] = payout_id
         
         await update.message.reply_text(
-            f"📸 Send Image for Payout #{payout_id}\n\n"
+            f"📸 Send Image for Payout {payout_id}\n\n"
             f"Please send an image (photo) as proof of payment:",
             reply_markup=ReplyKeyboardMarkup([["❌ Cancel"]], resize_keyboard=True)
         )
@@ -5278,13 +6488,13 @@ async def handle_payout_default_reject(update: Update, context: ContextTypes.DEF
             if success:
                 await send_user_notification(context, payout_dict['user_id'], default_message)
                 sent_msg = await update.message.reply_text(
-                    f"❌ Payout #{payout_id} rejected!",
+                    f"❌ Payout {payout_id} rejected!",
                     reply_markup=get_admin_menu_by_permissions(user.id)
                 )
                 await queue_message_for_deletion(user.id, sent_msg.message_id)
             else:
                 await update.message.reply_text(
-                    f"❌ Failed to reject payout #{payout_id}",
+                    f"❌ Failed to reject payout {payout_id}",
                     reply_markup=get_admin_menu_by_permissions(user.id)
                 )
         
@@ -5327,12 +6537,12 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await send_user_notification(context, user_id, message_text, temp_path)
             await post_payout_to_channel(context, user_id, amount, payout_method, payout_details, temp_path)
             await message.reply_text(
-                f"✅ Payout #{payout_id} approved with image!",
+                f"✅ Payout {payout_id} approved with image!",
                 reply_markup=get_admin_menu_by_permissions(user.id)
             )
         else:
             await message.reply_text(
-                f"❌ Failed to approve payout #{payout_id}",
+                f"❌ Failed to approve payout {payout_id}",
                 reply_markup=get_admin_menu_by_permissions(user.id)
             )
             
@@ -5521,7 +6731,7 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
         context.user_data['approving_payout'] = payout_id
         
         await query.message.reply_text(
-            f"💰 Approve Payout #{payout_id}\n\n"
+            f"💰 Approve Payout {payout_id}\n\n"
             f"How would you like to notify the user?",
             reply_markup=get_payout_approval_options()
         )
@@ -5532,7 +6742,7 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
         context.user_data['rejecting_payout'] = payout_id
         
         await query.message.reply_text(
-            f"❌ Reject Payout #{payout_id}\n\n"
+            f"❌ Reject Payout {payout_id}\n\n"
             f"How would you like to notify the user?",
             reply_markup=get_payout_rejection_options()
         )
@@ -5607,7 +6817,7 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
         context.user_data['balance_action'] = 'add'
         
         await query.message.reply_text(
-            f"💰 Add Balance to User #{user_id_to_manage}\n\n"
+            f"💰 Add Balance to User {user_id_to_manage}\n\n"
             f"Enter amount to add:\n"
             f"(Also enter reason after amount, separated by comma)\n\n"
             f"Example: 10.00, Bonus for good work",
@@ -5623,7 +6833,7 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
         context.user_data['balance_action'] = 'subtract'
         
         await query.message.reply_text(
-            f"📉 Subtract Balance from User #{user_id_to_manage}\n\n"
+            f"📉 Subtract Balance from User {user_id_to_manage}\n\n"
             f"Enter amount to subtract:\n"
             f"(Also enter reason after amount, separated by comma)\n\n"
             f"Example: 5.00, Penalty for rule violation",
@@ -5639,7 +6849,7 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
         context.user_data['awaiting_user_message'] = True
         
         await query.message.reply_text(
-            f"📨 Message User #{user_id_to_manage}\n\n"
+            f"📨 Message User {user_id_to_manage}\n\n"
             f"Enter message to send:",
             reply_markup=ReplyKeyboardMarkup([["❌ Cancel"]], resize_keyboard=True)
         )
@@ -5741,7 +6951,9 @@ def start_background_tasks():
     def expire_tasks_worker():
         while True:
             expire_old_tasks()
-            delete_expired_tasks()
+            expire_old_available_tasks()
+            expire_old_pending_otp_tasks()
+            delete_marked_tasks()
             time.sleep(3600)
     
     thread = threading.Thread(target=expire_tasks_worker, daemon=True)
@@ -5765,18 +6977,29 @@ def ensure_owner_admin():
 
 # ==================== MESSAGE HANDLER ====================
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Main message handler"""
     user = update.effective_user
     message = update.message
     text = message.text
     
-    # Queue user message for deletion after 72 hours
     await queue_message_for_deletion(user.id, message.message_id)
     update_user_activity(user.id)
     
-    # Handle OTP input for task completion - FIXED: Check for cancel/resend first inside the function
+    # Handle OTP input
     if 'awaiting_task_otp' in context.user_data:
         await handle_task_otp_input(update, context)
+        return
+    
+    # Handle direct task confirmation
+    if 'awaiting_task_confirmation' in context.user_data:
+        if text == "✅ Confirm Done":
+            await handle_confirm_task_done_direct(update, context)
+        elif text == "❌ Go Back":
+            await handle_task_back_to_task(update, context)
+        return
+    
+    # Handle expiry settings input
+    if 'awaiting_expiry_setting' in context.user_data and is_admin(user.id):
+        await handle_expiry_input(update, context)
         return
     
     # Handle milestone inputs
@@ -5810,6 +7033,11 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Handle delete task input
     if 'awaiting_delete_single_task' in context.user_data and is_admin(user.id):
         await handle_delete_single_task_input(update, context)
+        return
+    
+    # Handle generate OTP input
+    if 'awaiting_gen_otp_user' in context.user_data and is_admin(user.id):
+        await handle_gen_otp_user_input(update, context)
         return
     
     # Handle payment method inputs
@@ -5967,7 +7195,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             del context.user_data['awaiting_broadcast_user']
             
             await message.reply_text(
-                f"📨 Broadcast to User #{user_id}\n\n"
+                f"📨 Broadcast to User {user_id}\n\n"
                 f"Enter message to send:",
                 reply_markup=ReplyKeyboardMarkup([["❌ Cancel"]], resize_keyboard=True)
             )
@@ -5988,9 +7216,9 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         del context.user_data['awaiting_broadcast_user_message']
         
         if success:
-            response = f"✅ Message sent to user #{user_id}"
+            response = f"✅ Message sent to user {user_id}"
         else:
-            response = f"❌ Failed to send message to user #{user_id}"
+            response = f"❌ Failed to send message to user {user_id}"
             
         sent_msg = await message.reply_text(
             response,
@@ -6189,35 +7417,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
     
-    # Handle expiry hours
-    if 'awaiting_expiry_hours' in context.user_data and is_admin(user.id):
-        try:
-            hours = int(text.strip())
-            if hours < 1 or hours > 168:
-                await message.reply_text(
-                    "❌ Invalid hours! Must be between 1 and 168.",
-                    reply_markup=ReplyKeyboardMarkup([["❌ Cancel"]], resize_keyboard=True)
-                )
-                return
-                
-            update_system_setting('task_expiry_hours', str(hours))
-            del context.user_data['awaiting_expiry_hours']
-            
-            await message.reply_text(
-                f"✅ Task Expiry Updated!\n\n"
-                f"⏰ Tasks will now expire after {hours} hours.\n"
-                f"🗑️ Expired tasks older than 24 hours will be automatically deleted.",
-                reply_markup=get_admin_menu_by_permissions(user.id)
-            )
-            return
-            
-        except ValueError:
-            await message.reply_text(
-                "❌ Invalid number! Please enter a valid number of hours:",
-                reply_markup=ReplyKeyboardMarkup([["❌ Cancel"]], resize_keyboard=True)
-            )
-            return
-    
     # Handle admin message to user
     if 'awaiting_user_message' in context.user_data and is_admin(user.id):
         user_id = context.user_data['message_user_id']
@@ -6229,9 +7428,9 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         del context.user_data['awaiting_user_message']
         
         if success:
-            response = f"✅ Message sent to user #{user_id}"
+            response = f"✅ Message sent to user {user_id}"
         else:
-            response = f"❌ Failed to send message to user #{user_id}"
+            response = f"❌ Failed to send message to user {user_id}"
             
         sent_msg = await message.reply_text(
             response,
@@ -6500,6 +7699,18 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             return
             
+        elif text == "📋 Available Tasks" and 'available' in permissions:
+            await handle_available_tasks(update, context)
+            return
+            
+        elif text == "⏳ Pending OTP Tasks" and 'pending_otp' in permissions:
+            await handle_pending_otp_tasks(update, context)
+            return
+            
+        elif text == "💀 Expired Tasks" and 'expired' in permissions:
+            await handle_expired_tasks(update, context)
+            return
+            
         elif text == "⏳ Pending Tasks" and 'pending' in permissions:
             await handle_pending_tasks(update, context)
             return
@@ -6560,6 +7771,34 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await handle_set_contact_admin(update, context)
             return
             
+        elif text == "🔐 Toggle OTP" and 'otp_toggle' in permissions:
+            await handle_toggle_otp(update, context)
+            return
+            
+        elif text == "🔑 Generate OTP" and 'gen_otp' in permissions:
+            await handle_generate_otp(update, context)
+            return
+            
+        elif text == "⏰ Expire Time" and 'expire_settings' in permissions:
+            await handle_expire_time_menu(update, context)
+            return
+            
+        elif text.startswith("📋 Available Tasks:") and 'expire_settings' in permissions:
+            await handle_set_available_expiry(update, context)
+            return
+            
+        elif text.startswith("⏳ Pending OTP:") and 'expire_settings' in permissions:
+            await handle_set_pending_otp_expiry(update, context)
+            return
+            
+        elif text.startswith("✅ Assigned Tasks:") and 'expire_settings' in permissions:
+            await handle_set_assigned_expiry(update, context)
+            return
+            
+        elif text.startswith("🔔 Warning Before:") and 'expire_settings' in permissions:
+            await handle_set_warning_hours(update, context)
+            return
+            
         elif text == "✅ Enable Milestones" and 'setting' in permissions:
             await handle_milestone_enable(update, context)
             return
@@ -6588,32 +7827,60 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await handle_delete_tasks_menu(update, context)
             return
             
-        elif text == "🗑️ Delete Single Completed Task" and 'delete' in permissions:
+        elif text == "🗑️ Delete Single Completed" and 'delete' in permissions:
             await handle_delete_single_completed_task(update, context)
             return
             
-        elif text == "🗑️ Delete All Completed Tasks" and 'delete' in permissions:
+        elif text == "🗑️ Delete All Completed" and 'delete' in permissions:
             await handle_delete_all_completed_tasks(update, context)
             return
             
-        elif text == "🗑️ Delete All Failed Tasks" and 'delete' in permissions:
+        elif text == "🗑️ Delete All Failed" and 'delete' in permissions:
             await handle_delete_all_failed_tasks(update, context)
             return
             
-        elif text == "🗑️ Delete All Expired Tasks" and 'delete' in permissions:
+        elif text == "🗑️ Delete Single Available" and 'delete' in permissions:
+            await handle_delete_single_available_task(update, context)
+            return
+            
+        elif text == "🗑️ Delete All Available" and 'delete' in permissions:
+            await handle_delete_all_available_tasks(update, context)
+            return
+            
+        elif text == "🗑️ Delete Single Pending OTP" and 'delete' in permissions:
+            await handle_delete_single_pending_otp_task(update, context)
+            return
+            
+        elif text == "🗑️ Delete All Pending OTP" and 'delete' in permissions:
+            await handle_delete_all_pending_otp_tasks(update, context)
+            return
+            
+        elif text == "🗑️ Delete All Expired" and 'delete' in permissions:
             await handle_delete_all_expired_tasks(update, context)
             return
             
-        elif text == "📥 Export Completed Tasks" and 'export' in permissions:
+        elif text == "📥 Export Available" and 'export' in permissions:
+            await handle_export_available_tasks(update, context)
+            return
+            
+        elif text == "📥 Export Pending OTP" and 'export' in permissions:
+            await handle_export_pending_otp_tasks(update, context)
+            return
+            
+        elif text == "📥 Export Completed" and 'export' in permissions:
             await handle_export_completed_tasks(update, context)
             return
             
-        elif text == "📥 Export Failed Tasks" and 'export' in permissions:
+        elif text == "📥 Export Expired" and 'export' in permissions:
+            await handle_export_expired_tasks(update, context)
+            return
+            
+        elif text == "📥 Export Failed" and 'export' in permissions:
             await handle_export_failed_tasks(update, context)
             return
             
-        elif text == "📥 Export Expired Tasks" and 'export' in permissions:
-            await handle_export_expired_tasks(update, context)
+        elif text == "📥 Export Pending Review" and 'export' in permissions:
+            await handle_export_pending_review_tasks(update, context)
             return
             
         elif text == "💰 Edit Referral Bonus" and 'referral' in permissions:
@@ -6648,22 +7915,22 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await handle_email_accounts_menu(update, context)
             return
             
-        elif text.startswith("✅ Approve #") or text.startswith("❌ Reject #"):
+        elif text == "✅ Approve" or text == "❌ Reject":
             if 'pending' in permissions:
                 await handle_admin_task_action(update, context)
             return
             
-        elif text.startswith("💰 Add Balance #") or text.startswith("📉 Subtract Balance #"):
+        elif text.startswith("💰 Add Balance") or text.startswith("📉 Subtract Balance"):
             if 'manage' in permissions:
                 await handle_admin_balance_action(update, context)
             return
             
-        elif text.startswith("📨 Message User #"):
+        elif text.startswith("📨 Message User"):
             if 'manage' in permissions:
                 await handle_admin_message_user(update, context)
             return
             
-        elif text.startswith("📊 View Details #"):
+        elif text.startswith("📊 View Details"):
             if 'manage' in permissions:
                 await handle_admin_view_user_details(update, context)
             return
@@ -6696,7 +7963,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         elif text == "➕ Add Admin":
             if is_owner(user.id):
                 context.user_data.pop('awaiting_bonus_settings', None)
-                context.user_data.pop('awaiting_expiry_hours', None)
+                context.user_data.pop('awaiting_expiry_setting', None)
                 context.user_data.pop('awaiting_add_payment_method', None)
                 context.user_data.pop('awaiting_remove_payment_method', None)
                 context.user_data.pop('awaiting_add_channel', None)
@@ -6722,7 +7989,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         elif text == "➖ Remove Admin":
             if is_owner(user.id):
                 context.user_data.pop('awaiting_bonus_settings', None)
-                context.user_data.pop('awaiting_expiry_hours', None)
+                context.user_data.pop('awaiting_expiry_setting', None)
                 context.user_data.pop('awaiting_add_payment_method', None)
                 context.user_data.pop('awaiting_remove_payment_method', None)
                 context.user_data.pop('awaiting_add_channel', None)
@@ -6772,16 +8039,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     "Enter values in format:\n"
                     "min_withdrawal,referral_bonus,referral_percentage,task_reward\n\n"
                     "Example: 20.00,2.00,5.00,0.25",
-                    reply_markup=ReplyKeyboardMarkup([["❌ Cancel"]], resize_keyboard=True)
-                )
-            return
-            
-        elif text == "⏰ Set Expiry Hours":
-            if 'setting' in permissions:
-                context.user_data['awaiting_expiry_hours'] = True
-                await message.reply_text(
-                    "⏰ Set Task Expiry Hours\n\n"
-                    "Enter number of hours for task expiry (1-168):",
                     reply_markup=ReplyKeyboardMarkup([["❌ Cancel"]], resize_keyboard=True)
                 )
             return
@@ -7087,7 +8344,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # ==================== START COMMAND ====================
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle /start command with referral"""
     user = update.effective_user
     message = update.message
     
@@ -7160,7 +8416,6 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await show_channel_requirement(update, context, missing)
 
 async def refresh_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Force refresh the user's menu"""
     user = update.effective_user
     message = update.message
     
@@ -7237,14 +8492,21 @@ def main():
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     application.add_handler(MessageHandler(filters.PHOTO, handle_photo))
     
-    # Start background task for deleting old messages
     async def delete_old_messages_task():
         while True:
             await delete_old_messages(application.bot)
-            await asyncio.sleep(3600)  # Check every hour
+            await asyncio.sleep(3600)
     
     loop = asyncio.get_event_loop()
     loop.create_task(delete_old_messages_task())
+    
+    # Start warning checker
+    async def warning_checker_task():
+        while True:
+            await check_and_warn_admin(application)
+            await asyncio.sleep(3600)
+    
+    loop.create_task(warning_checker_task())
     
     logger.info(f"🤖 {BOT_NAME} Bot is starting...")
     logger.info(f"👑 Owner: {OWNER_ID} ({OWNER_USERNAME})")
@@ -7252,15 +8514,16 @@ def main():
     logger.info(f"📢 Payout Channel: {PAYOUT_CHANNEL}")
     logger.info(f"⚙️ Max active tasks per user: {MAX_ACTIVE_TASKS}")
     logger.info(f"📦 Max bulk tasks: {MAX_BULK_TASKS}")
-    logger.info("✅ Referral: Uses User ID as referral code")
-    logger.info("✅ Cancel Buttons: Working during OTP phase (FIXED)")
-    logger.info("✅ Payout Images: Sent to user and posted to channel")
-    logger.info("✅ Delete Tasks: Single completed, all completed, all failed, all expired (FIXED)")
-    logger.info("✅ Export Tasks: CSV with Name, Father Name, Email, Password (FIXED)")
-    logger.info("✅ Auto Delete Messages: All messages deleted after 72 hours")
-    logger.info("✅ Referral Settings: Admin can edit bonus and percentage")
-    logger.info("✅ Milestone Bonuses: Admin can enable/disable and broadcast")
-    logger.info("✅ Admin List: Fixed display issue")
+    logger.info("✅ All features enabled!")
+    logger.info("✅ Admin can view available tasks")
+    logger.info("✅ Admin can view pending OTP tasks")
+    logger.info("✅ Admin can view expired tasks")
+    logger.info("✅ Admin can generate OTP for users")
+    logger.info("✅ Admin can set expiry times")
+    logger.info("✅ Export to Excel (.xlsx) format")
+    logger.info("✅ Auto-delete after download (24 hours)")
+    logger.info("✅ All cancel buttons working")
+    logger.info("✅ OTP toggle available")
     
     application.run_polling(allowed_updates=Update.ALL_TYPES)
 
